@@ -1,0 +1,26 @@
+services:
+  tcp-server:
+    build:
+      context: .
+      dockerfile: server.Dockerfile
+    environment:
+      CRYPTO_KEY: "<key for cipher>"
+      BROKER_HOST: mqtt-server
+      BROKER_USER: connection
+      BROKER_PASSWORD: <set mqtt password>
+      WORKERS: 2
+      UVLOOP: false
+      SERVER_TARGET: "http:squid-server:3128;iperf:0.0.0.0:9091"
+      STAT_FILE: stat.json
+    restart: unless-stopped
+
+  squid-server:
+    image: ubuntu/squid
+    restart: unless-stopped
+
+  mqtt-server:
+    build:
+      context: .
+      dockerfile: server.Dockerfile
+    ports:
+      - "1883:1883/tcp"
