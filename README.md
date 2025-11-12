@@ -1,6 +1,6 @@
 # Forwarding TCP connections via MQTT broker
 
-This project enables you to create a local server for forwarding TCP connections. On the server side, it establishes persistent connections to remote destinations, supporting encryption. The solution delivers good performance and reliability. A similar project was previously published by me using HTTP/3 transport [here](/unaxfromsibiria/httpwood-totcp).
+This project enables you to create a local server for forwarding TCP connections. On the server side, it establishes persistent connections to remote destinations, supporting encryption. The solution delivers good performance and reliability. A similar project was previously published by me using HTTP/3 transport [here](https://github.com/unaxfromsibiria/httpwood-totcp).
 
 You can forward multiple TCP connections through a message broker, launch several infrastructure services without direct access, and define named enumerations for each service: `SOCKETS='redis:127.0.0.1:6379;db:127.0.0.1:5432;dev-api:127.0.0.1:8080;rabbit:127.0.0.1:5672'`
 
