@@ -79,8 +79,6 @@ STOP_W = "quit"
 SOCKETS = read_env_str("SOCKETS")
 # eg SOCKETS=ssh:localhost:22;web:0.0.0.0:80;postgres:127.0.0.1:5432
 STAT_FILE = read_env_str("STAT_FILE")
-RECONNECT_TIMEOUT = read_env_float("RECONNECT_TIMEOUT", 5)
-RECONNECT_ATTEMPT = read_env_int("RECONNECT_ATTEMPT", 30)
 BUFFER_SIZE = read_env_int("READ_BUFFER_SIZE", 1024 * 8)
 WORKERS = read_env_int("WORKERS")
 CONNECTION_IDLE_LIMIT = read_env_int("CONNECTION_IDLE_LIMIT", 300)
@@ -88,7 +86,7 @@ uvloop = read_env_bool("UVLOOP", True)
 use_compress = read_env_bool("COMPRESS", False)
 CRYPTO_KEY = read_env_str("CRYPTO_KEY")
 CRYPTO_ALG = Fernet(CRYPTO_KEY) if CRYPTO_KEY else None
-qos = read_env_int("QOS_LEVEL", 1)
+qos = read_env_int("QOS_LEVEL", 0)
 
 
 def _convert_data(data: bytes) -> bytes:
