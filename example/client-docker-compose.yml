@@ -11,7 +11,6 @@ services:
       BROKER_USER: connection
       STAT_FILE: stat.json
       SOCKETS: "iperf:0.0.0.0:9091;http:0.0.0.0:9090"
-      UVLOOP: false  # getting problem in PyPy runtime
       LOG_LEVEL: "info"
     ports:
       - "9090:9090/tcp"

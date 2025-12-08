@@ -85,6 +85,7 @@ BUFFER_SIZE = read_env_int("READ_BUFFER_SIZE", 1024 * 8)
 WORKERS = read_env_int("WORKERS")
 CONNECTION_IDLE_LIMIT = read_env_int("CONNECTION_IDLE_LIMIT", 300)
 uvloop = read_env_bool("UVLOOP", True)
+use_compress = read_env_bool("COMPRESS", False)
 CRYPTO_KEY = read_env_str("CRYPTO_KEY")
 CRYPTO_ALG = Fernet(CRYPTO_KEY) if CRYPTO_KEY else None
 qos = read_env_int("QOS_LEVEL", 1)
@@ -92,12 +93,13 @@ qos = read_env_int("QOS_LEVEL", 1)
 
 def _convert_data(data: bytes) -> bytes:
     """Compress and encrypt data for transmission."""
-    return zlib.compress(CRYPTO_ALG.encrypt(data) if CRYPTO_ALG else data, 9)
+    raw = CRYPTO_ALG.encrypt(data) if CRYPTO_ALG else data
+    return zlib.compress(raw, 9) if use_compress else raw
 
 
 def _restore_data(data: bytes) -> bytes:
     """Decompress and decrypt data from transmission."""
-    src_data = zlib.decompress(data)
+    src_data = zlib.decompress(data) if use_compress else data
     if CRYPTO_ALG:
         return CRYPTO_ALG.decrypt(src_data)
     else:
