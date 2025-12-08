@@ -14,6 +14,7 @@ example_server:
 	cp example/server.Dockerfile server/server.Dockerfile
 	cp example/mosquitto.Dockerfile server/mosquitto.Dockerfile
 	cp requirements.txt server/requirements.txt
+	cd server && mkdir .mqtt_pass && touch .mqtt_pass/password.txt
 	cp -R aiomsgbridge server/aiomsgbridge
 	@echo 'Edit all lines:'
 	cat server/docker-compose.yml | grep -e '>' | grep -e '<'
