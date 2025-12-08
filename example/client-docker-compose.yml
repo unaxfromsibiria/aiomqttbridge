@@ -5,7 +5,9 @@ services:
       dockerfile: client.Dockerfile
     environment:
       CRYPTO_KEY: "<key for cipher>"
-      BROKER_PASSWORD: <set in server>
+      BROKER_PASSWORD: "<set in server>"
+      BROKER_HOST: "<your server>"
+      BROKER_PORT: 1883
       BROKER_USER: connection
       STAT_FILE: stat.json
       SOCKETS: "iperf:0.0.0.0:9091;http:0.0.0.0:9090"
