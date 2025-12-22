@@ -9,7 +9,8 @@ services:
       BROKER_PASSWORD: "<set mqtt password>"
       CRYPTO_KEY: "<key for cipher>"
       WORKERS: 4
-      SERVER_TARGET: "http:squid-server:3128;iperf:0.0.0.0:9091"
+      SERVER_TCP_TARGET: "http:squid-server:3128;iperf-tcp:0.0.0.0:9091"
+      SERVER_UDP_TARGET: "iperf-udp:0.0.0.0:9092;dns:8.8.8.8:53"
       STAT_FILE: stat.json
     restart: unless-stopped
 

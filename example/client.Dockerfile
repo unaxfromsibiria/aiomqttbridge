@@ -15,5 +15,7 @@ RUN apt clean && rm -rf /var/lib/apt/lists/* && python -m pip cache purge
 
 EXPOSE 9090
 EXPOSE 9091
+EXPOSE 9092
+EXPOSE 5553
 
 CMD ["bash", "-c", "/opt/run.sh"]

@@ -30,13 +30,15 @@ docker compose up -d --build
 
 ### Check the example
 
-Using example socket 1:
+Using example socket 1-3:
 
 ```bash
 iperf -c 127.0.0.1 -p 9091
+iperf -u -c 127.0.0.1 -p 9092
+nslookup -port=5553 google.com 127.0.0.1
 ```
 
-and socket 2:
+and socket 4:
 
 ```bash
 curl -x http://127.0.0.1:9090 https://api.myip.com/

@@ -6,6 +6,7 @@ import os
 import pickle
 import uuid
 import zlib
+from asyncio.transports import DatagramTransport
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,20 +29,6 @@ class Message:
     data: bytes
     v: bytes
     x: int
-
-
-def sort_mgs(msg: Message) -> int:
-    """Sort messages by their sequence number."""
-    return msg.num
-
-
-async def read_queue(buffer: list, quit_cmd: list, queue: asyncio.Queue):
-    """Read a message from queue and add to buffer or mark quit command."""
-    msg: Message = await queue.get()
-    if isinstance(msg, str) and msg == STOP_W:
-        quit_cmd.append(1)
-    else:
-        buffer.append(msg)
 
 
 def read_env_str(name: str, default: str = "") -> str:
@@ -71,13 +58,27 @@ def read_env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def read_env_list(name: str, split_with: str = ";", default: list = []) -> list[str]:
+    """Read an environment variable and return its value as a list."""
+    result = []
+    values = read_env_str(name)
+    if values:
+        result.extend(values.split(split_with))
+    else:
+        result.extend(default)
+
+    return result
+
+
 LOG_LEVEL = read_env_str("LOG_LEVEL") or "info"
-SERVER_TARGET = read_env_str("SERVER_TARGET")
+SERVER_TCP_TARGET = read_env_list("SERVER_TCP_TARGET")
+SERVER_UDP_TARGET = read_env_list("SERVER_UDP_TARGET")
 BROKER_HOST = read_env_str("BROKER_HOST", "localhost")
 BROKER_USER = read_env_str("BROKER_USER")
 BROKER_PASSWORD = read_env_str("BROKER_PASSWORD")
 BROKER_PORT = read_env_int("BROKER_PORT", 1883)
 STOP_W = "quit"
+CLIENTS = read_env_list("CLIENTS", default=["client"])
 RECONNECT_TIMEOUT = read_env_float("RECONNECT_TIMEOUT", 5)
 RECONNECT_ATTEMPT = read_env_int("RECONNECT_ATTEMPT", 30)
 BUFFER_SIZE = read_env_int("READ_BUFFER_SIZE", 1024 * 8)
@@ -129,6 +130,74 @@ if uvloop:
         logger.critical(err)
 
 
+class UdpProxyProtocol(asyncio.DatagramProtocol):
+    """Protocol for handling UDP proxy connections"""
+
+    transport: Optional[DatagramTransport] = None
+    server: Optional["OutConnectionServer"] = None
+    _queue: Optional[asyncio.Queue] = None
+
+    def connection_made(self, transport: DatagramTransport):
+        self.transport = transport
+
+    def __init__(self, target: str, connection_id: str, server: Any, client_queue: asyncio.Queue):
+        self.target = target
+        self.server = server
+        self.index = 0
+        self.connection_id = connection_id
+        self._queue = client_queue
+
+    async def send_to_client(self, data: bytes, addr: str):
+        """
+        Send data to a connected client via MQTT topic.
+        This method serializes the data into a Message object and publishes it 
+        to an MQTT topic specific to the target and connection ID. It handles 
+        data conversion and includes error handling for both serialization and 
+        MQTT publishing operations.
+        """
+        loop = asyncio.get_event_loop()
+        self.index += 1
+        server = self.server
+        executor = self.server._executor
+        topic = self.server._out_topic_tpl.format(self.target)
+        logger.info(f"Data for topic '{topic}' to {len(data)} bytes client {self.connection_id}")
+        try:
+            if executor:
+                c_data = await loop.run_in_executor(executor, _convert_data, data)
+            else:
+                c_data = _convert_data(data)
+
+            msg_content = pickle.dumps(
+                Message(self.index, self.connection_id, c_data, uuid.uuid4().bytes, 0)
+            )
+            await traffic_stats_inc("udp_in", len(data))
+        except Exception as err:
+            logger.error(f"Error in handle read connection {addr}: {err}")
+            msg_content = pickle.dumps(Message(self.index, self.connection_id, b"", b"", 1))
+
+        try:
+            await server._mqtt_client.publish(topic, payload=msg_content, qos=qos)
+        except Exception as err:
+            logger.error(f"Error to send in {topic} from connection {self.connection_id} {addr}: {err}")
+        else:
+            await traffic_stats_inc("mqtt_out", len(msg_content))
+            server._latest_message[(self.target, self.connection_id)] = datetime.now()
+
+    def datagram_received(self, data: bytes, addr_info: tuple[str, int]):
+        """Handle incoming UDP datagrams"""
+        addr, _ = addr_info
+        logger.info(f"Data {len(data)} from {addr}")
+        asyncio.create_task(self.send_to_client(data, addr))
+
+    def error_received(self, exc):
+        logger.warning(f"Error for closing {exc} for {self.connection_id}")
+
+    def connection_lost(self, exc):
+        logger.info(f"Connection {self.connection_id} lost")
+        if self._queue:
+            self._queue.put_nowait(STOP_W)
+
+
 class OutConnectionServer:
     """
     TCP proxy server that forwards data between TCP targets and MQTT topics.
@@ -138,14 +207,15 @@ class OutConnectionServer:
     """
 
     _out_routes: Dict[tuple, asyncio.Queue] = {}
-    _wait_iteration_time: float = 0.0045
-    _iter_timeout: float = 0.0012
+    _wait_iteration_time: float = 0.08
+    _iter_timeout: float = 0.15
     _mqtt_client = None
     _topics: List[str]
     _out_topic_tpl: str
     _executor: ProcessPoolExecutor = None
     _latest_message: Dict[tuple, datetime] = {}
     tcp_targets: Dict[str, tuple] = {}
+    udp_targets: Dict[str, tuple] = {}
     service_check_interval: float = 3.0
     connections: Dict[tuple, Any] = {}
 
@@ -155,15 +225,17 @@ class OutConnectionServer:
         self._out_routes = {}
         self._latest_message = {}
         self.tcp_targets = {}
+        self.udp_targets = {}
         self.connections = {}
         self._topics = []
-        # Parse SERVER_TARGET
-        if not SERVER_TARGET:
-            raise ValueError("SERVER_TARGET environment variable is required")
+        if not (SERVER_TCP_TARGET or SERVER_UDP_TARGET):
+            raise ValueError("SERVER_TCP_TARGET or/and SERVER_UDP_TARGET environment variable is required")
 
         self._parse_targets()
         self._out_topic_tpl = "data/{}"
         for target_code in self.tcp_targets:
+            self._topics.append(f"func/{target_code}")
+        for target_code in self.udp_targets:
             self._topics.append(f"func/{target_code}")
 
     async def _process_reader(self, reader: asyncio.StreamReader, target: str, connection_id: str):
@@ -212,40 +284,41 @@ class OutConnectionServer:
         Reads messages from queue and writes them to TCP connection.
         Handles connection errors and message sorting.
         """
-        quit_cmd = []
-        parts = []
+        quit_cmd = False
         iter_time = self._wait_iteration_time
         while not quit_cmd:
-            parts.clear()
             try:
-                await asyncio.wait_for(read_queue(parts, quit_cmd, queue), timeout=iter_time)
+                msg = await asyncio.wait_for(queue.get(), timeout=iter_time)
             except asyncio.TimeoutError:
-                ...
+                msg = None
 
-            if parts:
-                self._latest_message[parts[0].client] = datetime.now()
-                parts.sort(key=sort_mgs)
+            if msg:
+                if isinstance(msg, str) and msg == STOP_W:
+                    quit_cmd = True
+                    continue
+
+                self._latest_message[msg.client] = datetime.now()
                 try:
-                    for msg in parts:
-                        writer.write(msg.data)
-                        await writer.drain()
-                        await traffic_stats_inc("tcp_out", len(msg.data))
+                    writer.write(msg.data)
+                    await writer.drain()
+                    await traffic_stats_inc("tcp_out", len(msg.data))
                 except Exception as err:
                     logger.error(f"Error in handle read connection: {err}")
-                    quit_cmd.append(1)
+                    quit_cmd = True
             else:
                 await asyncio.sleep(self._iter_timeout)
 
     def _parse_targets(self):
         """
-        Parse SERVER_TARGET environment variable into target configurations.
+        Parse SERVER_TCP_TARGET/SERVER_UDP_TARGET environment variable into target configurations.
         Converts target strings into structured configurations with unique codes
         and validates port numbers and host addresses.
         """
         tcp_targets = {}
+        udp_targets = {}
+        service_names = set()
         sockets = set()
-        
-        for target_socket in SERVER_TARGET.split(";"):
+        for target_socket in SERVER_TCP_TARGET:
             parts = target_socket.split(":")
             try:
                 target_code, t_host, t_port = parts
@@ -254,25 +327,110 @@ class OutConnectionServer:
                 t_port = int(t_port)
                 assert 1 <= t_port <= 2 ** 16
                 t_name = target_code
-                target_code = hashlib.sha1(target_code.encode()).hexdigest()[:8]
+                service_names.add(t_name)
+                target_codes = [
+                    hashlib.sha1(target_code.encode() + client.encode()).hexdigest()[:8]
+                    for client in CLIENTS
+                ]
             except Exception as err:
                 raise ValueError(
-                    f"Incorrect targets in env 'SERVER_TARGET': {parts} ({err})"
-                    " format:  'target_code1:host:port;target_code2:host:port'"
+                    f"Incorrect targets in env 'SERVER_TCP_TARGET': {parts} ({err})"
+                    " format: 'target_code1:host:port;target_code2:host:port'"
                 )
             else:
-                if (t_host, t_port) in sockets:
+                if (t_host, t_port, "tcp") in sockets:
                     raise ValueError(
                         f"Duplicate socket detected: {t_host}:{t_port}. "
                         "Each target must have a unique socket."
                     )
-                tcp_targets[target_code] = (t_name, t_host, t_port)
-                sockets.add((t_host, t_port))
-                logger.info(f"Target '{t_name}' in {t_host}:{t_port} with code: {target_code}")
-        
-        self.tcp_targets = tcp_targets
+                sockets.add((t_host, t_port, "tcp"))
+                for target_code in target_codes:
+                    tcp_targets[target_code] = (t_name, t_host, t_port)
+                    logger.info(f"Target '{t_name}' in {t_host}:{t_port} with code: {target_code}")
 
-    async def create_target_connection(self, target: str, connection_id: str, queue: asyncio.Queue):
+        for target_socket in SERVER_UDP_TARGET:
+            parts = target_socket.split(":")
+            try:
+                target_code, t_host, t_port = parts
+                assert target_code
+                assert t_host
+                t_port = int(t_port)
+                assert 1 <= t_port <= 2 ** 16
+                t_name = target_code
+                target_codes = [
+                    hashlib.sha1(target_code.encode() + client.encode()).hexdigest()[:8]
+                    for client in CLIENTS
+                ]
+            except Exception as err:
+                raise ValueError(
+                    f"Incorrect targets in env 'SERVER_UDP_TARGET': {parts} ({err})"
+                    " format: 'target_code1:host:port;target_code2:host:port'"
+                )
+            else:
+                logger.info(f"Target UDP service '{target_code}' {t_host}:{t_port}")
+                if t_name in service_names:
+                    raise ValueError(
+                        f"UDP service code '{t_name}' uses in TCP targets"
+                    )
+                if (t_host, t_port, "udp") in sockets:
+                    raise ValueError(
+                        f"Duplicate socket detected: {t_host}:{t_port}. "
+                        "Each target must have a unique socket."
+                    )
+                sockets.add((t_host, t_port, "udp"))
+                for target_code in target_codes:
+                    udp_targets[target_code] = (t_name, t_host, t_port)
+                    logger.info(f"Target '{t_name}' in {t_host}:{t_port} with code: {target_code}")
+
+        self.tcp_targets = tcp_targets
+        self.udp_targets = udp_targets
+
+    async def create_target_udp_connection(self, target: str, connection_id: str, queue: asyncio.Queue):
+        """
+        Create and manage a UDP connection to a target endpoint.
+        This method establishes a UDP datagram endpoint to the specified target and 
+        handles message forwarding between the queue and the UDP socket. It continuously
+        monitors the queue for incoming messages and sends them through the UDP connection.
+        """
+        t_name, target_host, target_port = self.udp_targets[target]
+        loop = asyncio.get_event_loop()
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: UdpProxyProtocol(target, connection_id, self, queue),
+            remote_addr=(target_host, target_port)
+        )
+        quit_cmd = False
+        iter_time = self._wait_iteration_time
+        while not quit_cmd:
+            try:
+                msg: Message = await asyncio.wait_for(queue.get(), timeout=iter_time)
+            except asyncio.TimeoutError:
+                msg = None
+
+            if msg:
+                if isinstance(msg, str) and msg == STOP_W:
+                    quit_cmd = True
+                    continue
+
+                self._latest_message[msg.client] = datetime.now()
+                try:
+                    transport.sendto(msg.data)
+                    await traffic_stats_inc("udp_out", len(msg.data))
+                except Exception as err:
+                    logger.error(f"Error in handle read connection: {err}")
+                    quit_cmd = True
+                else:
+                    logger.debug(f"Sending {len(msg.data)} bytes to {target_host}:{target_port}")
+            else:
+                await asyncio.sleep(self._iter_timeout)
+
+        if transport:
+            try:
+                logger.info(f"Closing udp {target} {connection_id}")
+                transport.close()
+            except Exception as err:
+                logger.error(f"UDP {target_host}:{target_port}:{t_name} close error {err}")
+
+    async def create_target_tcp_connection(self, target: str, connection_id: str, queue: asyncio.Queue):
         """
         Establish and manage connection to TCP target.
         Creates TCP connection to target and manages reader/writer tasks.
@@ -337,7 +495,20 @@ class OutConnectionServer:
                 logger.info(f"Listen {topic}")
 
         async for message in self._mqtt_client.messages:
-            target = next(code for code in self.tcp_targets if code in message.topic.value)
+            target = proto = None
+            for code in self.tcp_targets:
+                if code in message.topic.value:
+                    proto = "tcp"
+                    target = code
+                    break
+
+            if not proto:
+                for code in self.udp_targets:
+                    if code in message.topic.value:
+                        proto = "udp"
+                        target = code
+                        break
+
             if message.payload:
                 try:
                     msg: Message = pickle.loads(message.payload)
@@ -360,7 +531,13 @@ class OutConnectionServer:
 
                 if route_key not in self._out_routes:
                     queue = self._out_routes[route_key] = asyncio.Queue()
-                    task = loop.create_task(self.create_target_connection(target, msg.client, queue))
+                    task = loop.create_task(
+                        (
+                            self.create_target_tcp_connection(target, msg.client, queue)
+                        ) if proto == "tcp" else (
+                            self.create_target_udp_connection(target, msg.client, queue)
+                        )
+                    )
                     self.connections[route_key] = task
                 else:
                     queue = self._out_routes[route_key]

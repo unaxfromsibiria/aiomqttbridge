@@ -6,6 +6,7 @@ import os
 import pickle
 import uuid
 import zlib
+from asyncio.transports import DatagramTransport
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,20 +28,6 @@ class Message:
     data: bytes
     v: bytes
     x: int
-
-
-def sort_mgs(msg: Message) -> int:
-    """Sort messages by their sequence number."""
-    return msg.num
-
-
-async def read_queue(buffer: list, quit_cmd: list, queue: asyncio.Queue):
-    """Read a message from queue and add to buffer or mark quit command."""
-    msg: Message = await queue.get()
-    if isinstance(msg, str) and msg == STOP_W:
-        quit_cmd.append(1)
-    else:
-        buffer.append(msg)
 
 
 def read_env_str(name: str, default: str = "") -> str:
@@ -70,14 +57,29 @@ def read_env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def read_env_list(name: str, split_with: str = ";", default: list = []) -> list[str]:
+    """Read an environment variable and return its value as a list."""
+    result = []
+    values = read_env_str(name)
+    if values:
+        result.extend(values.split(split_with))
+    else:
+        result.extend(default)
+
+    return result
+
+
 LOG_LEVEL = read_env_str("LOG_LEVEL") or "info"
 BROKER_HOST = read_env_str("BROKER_HOST", "localhost")
 BROKER_USER = read_env_str("BROKER_USER")
 BROKER_PASSWORD = read_env_str("BROKER_PASSWORD")
 BROKER_PORT = read_env_int("BROKER_PORT", 1883)
 STOP_W = "quit"
-SOCKETS = read_env_str("SOCKETS")
-# eg SOCKETS=ssh:localhost:22;web:0.0.0.0:80;postgres:127.0.0.1:5432
+CLIENT = read_env_str("CLIENT", "client")
+TCP_SOCKETS = read_env_list("TCP_SOCKETS")
+UDP_SOCKETS = read_env_list("UDP_SOCKETS")
+# eg TCP_SOCKETS=ssh:localhost:22;web:0.0.0.0:80;postgres:127.0.0.1:5432
+# UDP_SOCKETS=dns:localhost:53;
 STAT_FILE = read_env_str("STAT_FILE")
 BUFFER_SIZE = read_env_int("READ_BUFFER_SIZE", 1024 * 8)
 WORKERS = read_env_int("WORKERS")
@@ -128,16 +130,16 @@ if uvloop:
         logger.critical(err)
 
 
-class SocketServer:
+class BaseSocketServer:
     """
-    Handles TCP to MQTT proxy server functionality.
-    This class manages bidirectional data transfer between TCP clients and MQTT brokers,
-    routing data through MQTT topics for communication between different services.
+    Base class for socket server implementations.
+    Provides common functionality for TCP and UDP socket servers including
+    message routing, connection management, and MQTT communication.
     """
-    
+
     _out_routes: Dict[str, asyncio.Queue] = {}
-    _wait_iteration_time: float = 0.0045
-    _iter_timeout: float = 0.0012
+    _wait_iteration_time: float = 0.08
+    _iter_timeout: float = 0.1
     _mqtt_client = None
     _topoc: str
     res_topic: str
@@ -157,7 +159,6 @@ class SocketServer:
         port: int
     ):
         """Initialize the proxy server with MQTT client and connection parameters."""
-        self.server = None
         self._out_routes = {}
         self._latest_message = {}
         self._target = target
@@ -165,70 +166,9 @@ class SocketServer:
         self._executor = executor
         self._host = host
         self._port = port
-        t_part = hashlib.sha1(target.encode()).hexdigest()[:8]
+        t_part = hashlib.sha1(target.encode() + CLIENT.encode()).hexdigest()[:8]
         self._topic = f"func/{t_part}"
         self.res_topic = f"data/{t_part}"
-
-    async def send_to_server(self, client: str, reader: asyncio.StreamReader):
-        """Send data from client to server via MQTT."""
-        index = 1
-        wait = True
-        loop = asyncio.get_event_loop()
-
-        while wait:
-
-            try:
-                data = await reader.read(BUFFER_SIZE)
-            except Exception as err:
-                logger.warning(f"Broken reading for '{client}': {err}")
-                wait = False
-                continue
-
-            if not data:
-                wait = False
-                continue
-
-            await traffic_stats_inc(f"tcp_in_{self._target}", len(data))
-            if self._executor:
-                c_data = await loop.run_in_executor(self._executor, _convert_data, data)
-            else:
-                c_data = _convert_data(data)
-
-            self._latest_message[client] = datetime.now()
-            msg_content = pickle.dumps(Message(index, client, c_data, uuid.uuid4().bytes, 0))
-            try:
-                await self._mqtt_client.publish(self._topic, payload=msg_content, qos=qos)
-            except Exception as err:
-                logger.error(f"Client {client} lost data in {index}: {err}")
-            else:
-                await traffic_stats_inc(f"mqtt_out_{self._target}", len(msg_content))
-                index += 1
-
-    async def send_to_client(self, queue: asyncio.Queue, writer: asyncio.StreamWriter):
-        """Send data from server to client."""
-        quit_cmd = []
-        parts = []
-        iter_time = self._wait_iteration_time
-        while not quit_cmd:
-            parts.clear()
-            try:
-                await asyncio.wait_for(read_queue(parts, quit_cmd, queue), timeout=iter_time)
-            except asyncio.TimeoutError:
-                ...
-
-            if parts:
-                self._latest_message[parts[0].client] = datetime.now()
-                parts.sort(key=sort_mgs)
-                try:
-                    for msg in parts:
-                        writer.write(msg.data)
-                        await writer.drain()
-                        await traffic_stats_inc(f"tcp_out_{self._target}", len(msg.data))
-                except Exception as err:
-                    logger.error(f"Error in handle read connection: {err}")
-                    quit_cmd.append(1)
-            else:
-                await asyncio.sleep(self._iter_timeout)
 
     async def claen_up(self):
         """
@@ -275,13 +215,161 @@ class SocketServer:
         if client in self._out_routes:
             del self._out_routes[client]
 
+
+class UdpSocketServer(BaseSocketServer):
+    """
+    UDP socket server implementation for proxy functionality.    
+    Handles UDP connections and forwards data between clients and target services
+    through MQTT broker.
+    """
+
+    index: int = 0
+    loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def add_client(self, client: str, addr: tuple[str, int], transport: DatagramTransport):
+        """Add a new UDP client to the server."""
+        if self.loop is None:
+            self.loop = asyncio.get_event_loop()
+        if client in self._out_routes:
+            return
+
+        self._out_routes[client] = queue = asyncio.Queue()
+        self.loop.create_task(self.send_to_client(client, queue, addr, transport))
+
+    async def send_to_client(self, client: str, queue: asyncio.Queue, addr: tuple[str, int], transport: DatagramTransport):
+        """Send data from server to UDP client."""
+        await traffic_stats_inc(f"new_connection_{self._target}")
+        logger.info(f"UDP client from {addr} id: {client} transport: {id(transport)}")
+        quit_cmd = False
+        iter_time = self._wait_iteration_time
+        addr_info = ":".join(map(str, addr))
+        while not quit_cmd:
+            try:
+                msg: Message = await asyncio.wait_for(queue.get(), timeout=iter_time)
+            except asyncio.TimeoutError:
+                msg = None
+
+            if msg:
+                if isinstance(msg, str) and msg == STOP_W:
+                    quit_cmd = True
+                    logger.info(f"Closed {addr_info} from client {client}")
+                    continue
+
+                self._latest_message[msg.client] = datetime.now()
+                try:
+                    transport.sendto(msg.data, addr)
+                    await traffic_stats_inc(f"udp_out_{self._target}", len(msg.data))
+                except Exception as err:
+                    logger.error(f"Error in handle read connection to ({addr_info} for {client}): {err}")
+                    quit_cmd = True
+            else:
+                await asyncio.sleep(self._iter_timeout)
+
+    def add_data(self, client: str, data: bytes, client_addr: str):
+        """Add data from a client to be sent to the target server."""
+        self.index += 1
+        self.loop.create_task(self.send_to_server(client, data, client_addr))
+
+    async def send_to_server(self, client: str, data: bytes, client_addr: str):
+        """Handle data received from client and forward to target"""
+        try:
+            await traffic_stats_inc(f"udp_in_{self._target}", len(data))
+            if self._executor:
+                c_data = await self.loop.run_in_executor(self._executor, _convert_data, data)
+            else:
+                c_data = _convert_data(data)
+
+            index = self.index
+            self._latest_message[client] = datetime.now()
+            msg_content = pickle.dumps(Message(index, client, c_data, uuid.uuid4().bytes, 0))
+            try:
+                await self._mqtt_client.publish(self._topic, payload=msg_content, qos=qos)
+            except Exception as err:
+                logger.error(f"Client {client} lost data in {index}: {err}")
+            else:
+                await traffic_stats_inc(f"mqtt_out_{self._target}", len(msg_content))
+                logger.debug(f"Topic '{self._topic}' got {len(msg_content)} bytes")
+        except Exception as err:
+            logger.error(f"Error forwarding data from {client_addr}: {err}")
+
+
+class TcpSocketServer(BaseSocketServer):
+    """
+    TCP socket server implementation for proxy functionality.
+    Handles TCP connections and forwards data between clients and target services
+    through MQTT broker with bidirectional communication.
+    """
+
+    server = None
+
+    async def send_to_server(self, client: str, reader: asyncio.StreamReader):
+        """Send data from client to server via MQTT."""
+        index = 1
+        wait = True
+        loop = asyncio.get_event_loop()
+
+        while wait:
+
+            try:
+                data = await reader.read(BUFFER_SIZE)
+            except Exception as err:
+                logger.warning(f"Broken reading for '{client}': {err}")
+                wait = False
+                continue
+
+            if not data:
+                wait = False
+                continue
+
+            await traffic_stats_inc(f"tcp_in_{self._target}", len(data))
+            if self._executor:
+                c_data = await loop.run_in_executor(self._executor, _convert_data, data)
+            else:
+                c_data = _convert_data(data)
+
+            self._latest_message[client] = datetime.now()
+            msg_content = pickle.dumps(Message(index, client, c_data, uuid.uuid4().bytes, 0))
+            try:
+                await self._mqtt_client.publish(self._topic, payload=msg_content, qos=qos)
+            except Exception as err:
+                logger.error(f"Client {client} lost data in {index}: {err}")
+            else:
+                await traffic_stats_inc(f"mqtt_out_{self._target}", len(msg_content))
+                index += 1
+
+    async def send_to_client(self, queue: asyncio.Queue, writer: asyncio.StreamWriter):
+        """Send data from server to client."""
+        quit_cmd = False
+        iter_time = self._wait_iteration_time
+        while not quit_cmd:
+            try:
+                msg = await asyncio.wait_for(queue.get(), timeout=iter_time)
+            except asyncio.TimeoutError:
+                msg = None
+
+            if msg:
+                if isinstance(msg, str) and msg == STOP_W:
+                    quit_cmd = True
+                    continue
+
+                self._latest_message[msg.client] = datetime.now()
+                try:
+                    writer.write(msg.data)
+                    await writer.drain()
+                    await traffic_stats_inc(f"tcp_out_{self._target}", len(msg.data))
+                except Exception as err:
+                    logger.error(f"Error in handle read connection: {err}")
+                    quit_cmd = True
+            else:
+                await asyncio.sleep(self._iter_timeout)
+
     async def handle_client(self, client_reader, client_writer):
         """Handle client connection and bidirectional data transfer."""
         client = hashlib.sha1(f"client:{id(client_writer)}".encode()).hexdigest()
         await traffic_stats_inc(f"new_connection_{self._target}")
         try:
             c_host = client_writer.get_extra_info("peername")
-            logger.info(f"Client connected from {c_host} id: {client}")
+            logger.info(f"Client tcp-connected from {c_host} id: {client}")
 
             if client in self._out_routes:
                 queue = self._out_routes[client]
@@ -316,31 +404,87 @@ class SocketServer:
             logger.warning(f"Closing {client} error: {err}")
 
 
-class TcpConnectionServer:
+class UdpProxyProtocol(asyncio.DatagramProtocol):
+    """Protocol for handling UDP proxy connections"""
+
+    transport: Optional[DatagramTransport] = None
+
+    def connection_made(self, transport: DatagramTransport):
+        self.transport = transport
+
+    def __init__(self, server: UdpSocketServer):
+        self.server = server
+
+    def datagram_received(self, data: bytes, addr_info: tuple[str, int]):
+        """Handle incoming UDP datagrams"""
+        addr, _ = addr_info
+        client = hashlib.sha1(f"client:{id(self.transport)}{addr_info}".encode()).hexdigest()
+        self.server.add_client(client, addr_info, self.transport)
+        self.server.add_data(client, data, addr)
+
+    def error_received(self, exc):
+        logger.warning(f"Error for closing {exc}")
+
+    def connection_lost(self, exc):
+        logger.info("Connection udp lost")
+
+
+class LocalConnectionServer:
     """
-    TCP connection server that manages proxy connections to target hosts.
-    This server handles TCP connections, forwards traffic through MQTT,
+    TCP/UDP connection server that manages proxy connections to target hosts.
+    This server handles TCP/UDP connections, forwards traffic through MQTT,
     and maintains connection statistics.
     """
-    
-    sockets: Dict[str, SocketServer] = {}
-    service_check_interval: float = 3.0
-    _iter_timeout: float = 0.0012
 
-    async def make_server(self, new_server: SocketServer):
+    sockets: Dict[str, BaseSocketServer] = {}
+    service_check_interval: float = 3.0
+    _iter_timeout: float = 0.0050
+
+    async def make_udp_server(self, new_server: UdpSocketServer):
         """
-        Start a TCP server for the given SocketServer instance.
+        Starts a UDP server to listen for incoming connections.
+        This method creates a UDP transport socket on the specified host and port,
+        which forwards incoming traffic through an MQTT broker.
+        The server runs in a loop until it is manually stopped.
         """
+        loop = asyncio.get_event_loop()
+        transport = None
+        wait = True
+
+        def new_client(*args, **kwargs) -> UdpProxyProtocol:
+            return UdpProxyProtocol(new_server)
+
+        try:
+            transport, _ = await loop.create_datagram_endpoint(
+                new_client,
+                local_addr=(new_server._host, new_server._port)
+            )
+            logger.info(
+                f"Server started on UDP {new_server._host}:{new_server._port} "
+                f"transport: {id(transport)} connection to {BROKER_HOST}"
+            )
+            try:
+                while wait:
+                    await asyncio.sleep(self.service_check_interval)
+            except KeyboardInterrupt:
+                logger.info("Server UDP stopped")
+                if transport:
+                    transport.close()
+
+        except Exception as err:
+            wait = False
+            logger.error(f"Error starting server: {err}")
+
+    async def make_tcp_server(self, new_server: TcpSocketServer):
+        """Start a TCP server for the given SocketServer instance."""
         server = await asyncio.start_server(new_server.handle_client, new_server._host, new_server._port)
-        logger.info(f"Server started on {new_server._host}:{new_server._port} connection to {BROKER_HOST}")
+        logger.info(f"Server started on TCP {new_server._host}:{new_server._port} connection to {BROKER_HOST}")
         async with server:
             new_server.server = server
             await server.serve_forever()
 
     async def start_server(self, executor: Optional[ProcessPoolExecutor] = None):
-        """
-        Start the proxy server with configured target sockets.
-        """
+        """Start the proxy server with configured target sockets."""
         self._executor = executor
         self.sockets = {}
         handlers = []
@@ -353,7 +497,27 @@ class TcpConnectionServer:
         ) as client:
             self._mqtt_client = client
 
-            for target_socket in SOCKETS.split(";"):
+            all_codes = set()
+            for target_socket in TCP_SOCKETS:
+                parts = target_socket.split(":")
+                try:
+                    target_code, t_host, t_port = parts
+                    assert target_code
+                    all_codes.add(target_code)
+                    assert t_host
+                    t_port = int(t_port)
+                    assert 1 <= t_port <= 2 ** 16
+                except Exception as err:
+                    raise ValueError(
+                        f"Incorrect targets in env 'TCP_SOCKETS': {parts} ({err})"
+                        " format: 'target_code1:host:port;target_code2:host:port'"
+                    )
+
+                server = TcpSocketServer(client, executor, target_code, t_host, t_port)
+                self.sockets[target_code] = server
+                handlers.append(self.make_tcp_server(server))
+
+            for target_socket in UDP_SOCKETS:
                 parts = target_socket.split(":")
                 try:
                     target_code, t_host, t_port = parts
@@ -363,14 +527,18 @@ class TcpConnectionServer:
                     assert 1 <= t_port <= 2 ** 16
                 except Exception as err:
                     raise ValueError(
-                        f"Incorrect targets in env 'SOCKETS': {parts} ({err})"
-                        " format:  'target_code1:host:port;target_code2:host:port'"
+                        f"Incorrect targets in env 'UDP_SOCKETS': {parts} ({err})"
+                        " format: 'target_code1:host:port;target_code2:host:port'"
                     )
-                    continue
 
-                server = SocketServer(client, executor, target_code, t_host, t_port)
+                if target_code in all_codes:
+                    raise ValueError(
+                        f"Use different service codes for TCP and UDP targets ({target_code} in tcp-list)"
+                    )
+
+                server = UdpSocketServer(client, executor, target_code, t_host, t_port)
                 self.sockets[target_code] = server
-                handlers.append(self.make_server(server))
+                handlers.append(self.make_udp_server(server))
 
             if handlers:
                 handlers.append(self.wait_messages())
@@ -378,29 +546,27 @@ class TcpConnectionServer:
                 await asyncio.gather(*handlers)
 
     async def service_process(self):
-        """
-        Periodically clean up connections and save traffic statistics.
-        """
+        """Periodically clean up connections and save traffic statistics."""
         wait = True
         while wait:
             await asyncio.sleep(self.service_check_interval)
             for _, server in self.sockets.items():
-                await server.claen_up()  # Note: Typo in original code - should be "clean_up"
+                await server.claen_up()
 
             # save satistic
-            if STAT_FILE:
-                try:
-                    with open(STAT_FILE, "w") as json_file:
-                        traffic_stats_dict = dict(traffic_stats)
-                        traffic_stats_dict["updated"] = datetime.now().isoformat()
-                        json.dump(traffic_stats_dict, json_file, indent=2)
-                except Exception as err:
-                    logger.error(f"Problem {err} ti save statistic into '{STAT_FILE}'")
+            if not STAT_FILE:
+                continue
+
+            try:
+                with open(STAT_FILE, "w") as json_file:
+                    traffic_stats_dict = dict(traffic_stats)
+                    traffic_stats_dict["updated"] = datetime.now().isoformat()
+                    json.dump(traffic_stats_dict, json_file, indent=2)
+            except Exception as err:
+                logger.error(f"Problem {err} in saving statistic into '{STAT_FILE}'")
 
     async def wait_messages(self):
-        """
-        Wait for and process incoming MQTT messages.
-        """
+        """Wait for and process incoming MQTT messages."""
         loop = asyncio.get_event_loop()
 
         up_topics = 0
@@ -471,9 +637,9 @@ class TcpConnectionServer:
 async def main():
     """
     Main entry point for the proxy server.
-    Starts the TCP connection server with optional process pool execution.
+    Starts the TCP/UDP connection server with optional process pool execution.
     """
-    server = TcpConnectionServer()
+    server = LocalConnectionServer()
     if WORKERS > 0:
         with ProcessPoolExecutor(max_workers=WORKERS) as executor:
             await server.start_server(executor)

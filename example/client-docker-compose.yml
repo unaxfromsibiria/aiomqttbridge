@@ -10,9 +10,12 @@ services:
       BROKER_PORT: 1883
       BROKER_USER: connection
       STAT_FILE: stat.json
-      SOCKETS: "iperf:0.0.0.0:9091;http:0.0.0.0:9090"
+      TCP_SOCKETS: "iperf-tcp:0.0.0.0:9091;http:0.0.0.0:9090"
+      UDP_SOCKETS: "iperf-udp:0.0.0.0:9092;dns:0.0.0.0:5553"
       LOG_LEVEL: "info"
     ports:
       - "9090:9090/tcp"
       - "9091:9091/tcp"
+      - "9092:9092/udp"
+      - "5553:5553/udp"
     restart: unless-stopped
