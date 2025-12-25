@@ -2,14 +2,12 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import pickle
 import uuid
-import zlib
 from asyncio.transports import DatagramTransport
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime
+from time import monotonic
 from typing import Any
 from typing import Dict
 from typing import Optional
@@ -17,94 +15,35 @@ from typing import Optional
 from aiomqtt import Client
 from aiomqtt import ProtocolVersion
 from cachetools import TTLCache
-from cryptography.fernet import Fernet
 
+from .common import BROKER_HOST
+from .common import BROKER_PASSWORD
+from .common import BROKER_PORT
+from .common import BROKER_USER
+from .common import BUFFER_SIZE
+from .common import CONNECTION_IDLE_LIMIT
+from .common import LOG_LEVEL
+from .common import STAT_FILE
+from .common import STOP_W
+from .common import WORKERS
+from .common import Chunk
+from .common import IndexManager
+from .common import Message
+from .common import make_convert_data
+from .common import make_restore_data
+from .common import qos
+from .common import read_env_float
+from .common import read_env_int
+from .common import read_env_list
+from .common import read_env_str
 
-@dataclass
-class Message:
-    """Represents a message with sequence number, client identifier, data, version, and x value."""
-    num: int
-    client: str
-    data: bytes
-    v: bytes
-    x: int
-
-
-def read_env_str(name: str, default: str = "") -> str:
-    """Read an environment variable and return its string value."""
-    return str(os.environ.get(name, default))
-
-
-def read_env_bool(name: str, default: bool = False) -> bool:
-    """Read an environment variable and convert its value to boolean."""
-    value = os.environ.get(name, f"{default}").lower()
-    return value in ("true", "on", "ok", "1", "yes")
-
-
-def read_env_float(name: str, default: float = 0.0) -> float:
-    """Read an environment variable and convert its value to float."""
-    try:
-        return float(os.environ.get(name, default))
-    except ValueError:
-        return default
-
-
-def read_env_int(name: str, default: int = 0) -> int:
-    """Read an environment variable and convert its value to integer."""
-    try:
-        return int(os.environ.get(name, default))
-    except ValueError:
-        return default
-
-
-def read_env_list(name: str, split_with: str = ";", default: list = []) -> list[str]:
-    """Read an environment variable and return its value as a list."""
-    result = []
-    values = read_env_str(name)
-    if values:
-        result.extend(values.split(split_with))
-    else:
-        result.extend(default)
-
-    return result
-
-
-LOG_LEVEL = read_env_str("LOG_LEVEL") or "info"
-BROKER_HOST = read_env_str("BROKER_HOST", "localhost")
-BROKER_USER = read_env_str("BROKER_USER")
-BROKER_PASSWORD = read_env_str("BROKER_PASSWORD")
-BROKER_PORT = read_env_int("BROKER_PORT", 1883)
-STOP_W = "quit"
 CLIENT = read_env_str("CLIENT", "client")
 TCP_SOCKETS = read_env_list("TCP_SOCKETS")
 UDP_SOCKETS = read_env_list("UDP_SOCKETS")
+CHUNK_COLLECT_DELAY = read_env_float("CHUNK_COLLECT_DELAY", 0.075)
+
 # eg TCP_SOCKETS=ssh:localhost:22;web:0.0.0.0:80;postgres:127.0.0.1:5432
 # UDP_SOCKETS=dns:localhost:53;
-STAT_FILE = read_env_str("STAT_FILE")
-BUFFER_SIZE = read_env_int("READ_BUFFER_SIZE", 1024 * 8)
-WORKERS = read_env_int("WORKERS")
-CONNECTION_IDLE_LIMIT = read_env_int("CONNECTION_IDLE_LIMIT", 300)
-uvloop = read_env_bool("UVLOOP", True)
-use_compress = read_env_bool("COMPRESS", False)
-CRYPTO_KEY = read_env_str("CRYPTO_KEY")
-CRYPTO_ALG = Fernet(CRYPTO_KEY) if CRYPTO_KEY else None
-qos = read_env_int("QOS_LEVEL", 0)
-
-
-def _convert_data(data: bytes) -> bytes:
-    """Compress and encrypt data for transmission."""
-    raw = CRYPTO_ALG.encrypt(data) if CRYPTO_ALG else data
-    return zlib.compress(raw, 9) if use_compress else raw
-
-
-def _restore_data(data: bytes) -> bytes:
-    """Decompress and decrypt data from transmission."""
-    src_data = zlib.decompress(data) if use_compress else data
-    if CRYPTO_ALG:
-        return CRYPTO_ALG.decrypt(src_data)
-    else:
-        return src_data
-
 
 logger = logging.getLogger(__name__)
 traffic_stats = TTLCache(maxsize=1000, ttl=3600 * 24)
@@ -120,14 +59,76 @@ async def traffic_stats_inc(key: str, val: int = 1):
             traffic_stats[key] = val
 
 
+async def set_stats_value(key: str, val: float):
+    """Increment traffic statistics for a given key."""
+    async with stat_lock:
+        traffic_stats[key] = val
+
 level = getattr(logging, LOG_LEVEL.upper(), logging.WARNING)
 logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
-if uvloop:
-    try:
-        import uvloop
-        uvloop.install()
-    except Exception as err:
-        logger.critical(err)
+
+
+class ChunkPublisher:
+    """
+    Publishes chunks of messages via MQTT.
+    """
+
+    _warning_size: int = 32
+    _queue: asyncio.Queue
+    mqtt_client: Client
+    topic: str
+    index: IndexManager
+    _wait: bool = True
+
+    def send(self, msg: Message):
+        """Send a message to the internal queue for publishing."""
+        self._queue.put_nowait(msg)
+
+    def __init__(self, mqtt_client: Client, topic: str):
+        """Initialize the ChunkPublisher."""
+        self.index = IndexManager()
+        self._queue = asyncio.Queue()
+        self.topic = topic
+        self.mqtt_client = mqtt_client
+        self._wait = True
+
+    def close(self):
+        self._wait = False
+
+    async def process(self):
+        """Process and publish messages in chunks."""
+        wait = True
+        limit = CHUNK_COLLECT_DELAY
+        mid_ch_size = 1
+        while wait:
+            start = monotonic()
+            chunk = Chunk([], self.index.get())
+            while monotonic() - start < limit:
+                try:
+                    msg: Message = await asyncio.wait_for(self._queue.get(), timeout=limit)
+                except asyncio.TimeoutError:
+                    continue
+                else:
+                    chunk.m.append(msg)
+
+            if not chunk.m:
+                continue
+            elif len(chunk.m) > self._warning_size:
+                logger.warning(f"Too many output data in '{self.topic}' buffer: {len(chunk.m)}")
+
+            data = pickle.dumps(chunk)
+            mid_ch_size = (mid_ch_size + len(chunk.m)) / 2
+
+            try:
+                await self.mqtt_client.publish(self.topic, payload=data, qos=qos)
+            except Exception as err:
+                logger.error(f"Client {self.topic} lost data in {chunk.i}: {err}")
+                await asyncio.sleep(limit)
+            else:
+                await traffic_stats_inc(f"output_topic_{self.topic}", len(data))
+
+            wait = self._wait
+            await set_stats_value(f"mean_chunk_{self.topic}", mid_ch_size)
 
 
 class BaseSocketServer:
@@ -149,6 +150,9 @@ class BaseSocketServer:
     _target: str = ""
     _port: int = 0
     _host: str = ""
+    short_buffer_size: int = 32
+    index: IndexManager
+    pub: ChunkPublisher
 
     def __init__(
         self,
@@ -159,6 +163,7 @@ class BaseSocketServer:
         port: int
     ):
         """Initialize the proxy server with MQTT client and connection parameters."""
+        self.index = IndexManager()
         self._out_routes = {}
         self._latest_message = {}
         self._target = target
@@ -167,8 +172,11 @@ class BaseSocketServer:
         self._host = host
         self._port = port
         t_part = hashlib.sha1(target.encode() + CLIENT.encode()).hexdigest()[:8]
-        self._topic = f"func/{t_part}"
         self.res_topic = f"data/{t_part}"
+        self.pub = ChunkPublisher(mqtt_client, f"func/{t_part}")
+
+    def close(self):
+        self.pub.close()
 
     async def claen_up(self):
         """
@@ -223,7 +231,6 @@ class UdpSocketServer(BaseSocketServer):
     through MQTT broker.
     """
 
-    index: int = 0
     loop: Optional[asyncio.AbstractEventLoop] = None
 
     def add_client(self, client: str, addr: tuple[str, int], transport: DatagramTransport):
@@ -233,7 +240,7 @@ class UdpSocketServer(BaseSocketServer):
         if client in self._out_routes:
             return
 
-        self._out_routes[client] = queue = asyncio.Queue()
+        self._out_routes[client] = queue = asyncio.Queue(maxsize=self.short_buffer_size)
         self.loop.create_task(self.send_to_client(client, queue, addr, transport))
 
     async def send_to_client(self, client: str, queue: asyncio.Queue, addr: tuple[str, int], transport: DatagramTransport):
@@ -267,7 +274,6 @@ class UdpSocketServer(BaseSocketServer):
 
     def add_data(self, client: str, data: bytes, client_addr: str):
         """Add data from a client to be sent to the target server."""
-        self.index += 1
         self.loop.create_task(self.send_to_server(client, data, client_addr))
 
     async def send_to_server(self, client: str, data: bytes, client_addr: str):
@@ -275,20 +281,14 @@ class UdpSocketServer(BaseSocketServer):
         try:
             await traffic_stats_inc(f"udp_in_{self._target}", len(data))
             if self._executor:
-                c_data = await self.loop.run_in_executor(self._executor, _convert_data, data)
+                c_data = await self.loop.run_in_executor(self._executor, make_convert_data, data)
             else:
-                c_data = _convert_data(data)
+                c_data = make_convert_data(data)
 
-            index = self.index
+            index = self.index.get()
             self._latest_message[client] = datetime.now()
-            msg_content = pickle.dumps(Message(index, client, c_data, uuid.uuid4().bytes, 0))
-            try:
-                await self._mqtt_client.publish(self._topic, payload=msg_content, qos=qos)
-            except Exception as err:
-                logger.error(f"Client {client} lost data in {index}: {err}")
-            else:
-                await traffic_stats_inc(f"mqtt_out_{self._target}", len(msg_content))
-                logger.debug(f"Topic '{self._topic}' got {len(msg_content)} bytes")
+            self.pub.send(Message(index, client, c_data, uuid.uuid4().bytes, 0))
+            await traffic_stats_inc(f"mqtt_out_{self._target}", len(c_data) + 32)
         except Exception as err:
             logger.error(f"Error forwarding data from {client_addr}: {err}")
 
@@ -304,7 +304,6 @@ class TcpSocketServer(BaseSocketServer):
 
     async def send_to_server(self, client: str, reader: asyncio.StreamReader):
         """Send data from client to server via MQTT."""
-        index = 1
         wait = True
         loop = asyncio.get_event_loop()
 
@@ -323,19 +322,14 @@ class TcpSocketServer(BaseSocketServer):
 
             await traffic_stats_inc(f"tcp_in_{self._target}", len(data))
             if self._executor:
-                c_data = await loop.run_in_executor(self._executor, _convert_data, data)
+                c_data = await loop.run_in_executor(self._executor, make_convert_data, data)
             else:
-                c_data = _convert_data(data)
+                c_data = make_convert_data(data)
 
             self._latest_message[client] = datetime.now()
-            msg_content = pickle.dumps(Message(index, client, c_data, uuid.uuid4().bytes, 0))
-            try:
-                await self._mqtt_client.publish(self._topic, payload=msg_content, qos=qos)
-            except Exception as err:
-                logger.error(f"Client {client} lost data in {index}: {err}")
-            else:
-                await traffic_stats_inc(f"mqtt_out_{self._target}", len(msg_content))
-                index += 1
+            index = self.index.get()
+            self.pub.send(Message(index, client, c_data, uuid.uuid4().bytes, 0))
+            await traffic_stats_inc(f"mqtt_out_{self._target}", len(c_data) + 32)
 
     async def send_to_client(self, queue: asyncio.Queue, writer: asyncio.StreamWriter):
         """Send data from server to client."""
@@ -374,7 +368,7 @@ class TcpSocketServer(BaseSocketServer):
             if client in self._out_routes:
                 queue = self._out_routes[client]
             else:
-                self._out_routes[client] = queue = asyncio.Queue()
+                self._out_routes[client] = queue = asyncio.Queue(maxsize=self.short_buffer_size)
 
             # Create tasks to handle bidirectional data transfer
             tasks = [
@@ -439,6 +433,7 @@ class LocalConnectionServer:
     sockets: Dict[str, BaseSocketServer] = {}
     service_check_interval: float = 3.0
     _iter_timeout: float = 0.0050
+    _wait: bool = True
 
     async def make_udp_server(self, new_server: UdpSocketServer):
         """
@@ -516,6 +511,7 @@ class LocalConnectionServer:
                 server = TcpSocketServer(client, executor, target_code, t_host, t_port)
                 self.sockets[target_code] = server
                 handlers.append(self.make_tcp_server(server))
+                handlers.append(server.pub.process())
 
             for target_socket in UDP_SOCKETS:
                 parts = target_socket.split(":")
@@ -539,6 +535,7 @@ class LocalConnectionServer:
                 server = UdpSocketServer(client, executor, target_code, t_host, t_port)
                 self.sockets[target_code] = server
                 handlers.append(self.make_udp_server(server))
+                handlers.append(server.pub.process())
 
             if handlers:
                 handlers.append(self.wait_messages())
@@ -547,8 +544,7 @@ class LocalConnectionServer:
 
     async def service_process(self):
         """Periodically clean up connections and save traffic statistics."""
-        wait = True
-        while wait:
+        while self._wait:
             await asyncio.sleep(self.service_check_interval)
             for _, server in self.sockets.items():
                 await server.claen_up()
@@ -605,6 +601,8 @@ class LocalConnectionServer:
                         try:
                             sock_server.put_client_message(msg.client, STOP_W)
                             # self._closig[msg.client] = datetime.now()
+                        except asyncio.QueueFull:
+                            logger.warning(f"Failed to send STOP_W to client {msg.client}.")
                         except Exception as err:
                             logger.error(f"Failed to send STOP_W to client {msg.client}: {err}")
                         else:
@@ -614,9 +612,9 @@ class LocalConnectionServer:
 
                     try:
                         if self._executor:
-                            data = await loop.run_in_executor(self._executor, _restore_data, msg.data)
+                            data = await loop.run_in_executor(self._executor, make_restore_data, msg.data)
                         else:
-                            data = _restore_data(msg.data)
+                            data = make_restore_data(msg.data)
                         msg.data = data
                     except Exception as err:
                         logger.error(f"Failed to restore data for client {msg.client}: {err}")
@@ -624,6 +622,8 @@ class LocalConnectionServer:
 
                     try:
                         sock_server.put_client_message(msg.client, msg)
+                    except asyncio.QueueFull:
+                        logger.warning(f"Failed to put message in queue for client {msg.client}")
                     except Exception as err:
                         logger.error(f"Failed to put message in queue for client {msg.client}: {err}")
                         # Remove the client from routes if queue is broken
@@ -632,6 +632,10 @@ class LocalConnectionServer:
                 await asyncio.sleep(self._iter_timeout)
 
         logger.warning("Closed topics")
+        self._wait = False
+        if self.sockets:
+            for server in self.sockets.values():
+                server.close()
 
 
 async def main():

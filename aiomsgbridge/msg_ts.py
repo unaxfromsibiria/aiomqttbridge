@@ -2,13 +2,10 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import pickle
 import uuid
-import zlib
 from asyncio.transports import DatagramTransport
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from typing import Dict
@@ -18,93 +15,34 @@ from typing import Optional
 from aiomqtt import Client
 from aiomqtt import ProtocolVersion
 from cachetools import TTLCache
-from cryptography.fernet import Fernet
 
+from .common import BROKER_HOST
+from .common import BROKER_PASSWORD
+from .common import BROKER_PORT
+from .common import BROKER_USER
+from .common import BUFFER_SIZE
+from .common import CONNECTION_IDLE_LIMIT
+from .common import LOG_LEVEL
+from .common import STAT_FILE
+from .common import STOP_W
+from .common import WORKERS
+from .common import Chunk
+from .common import Message
+from .common import make_convert_data
+from .common import make_restore_data
+from .common import qos
+from .common import read_env_float
+from .common import read_env_int
+from .common import read_env_list
+from .common import read_env_str
+from .common import sort_message
 
-@dataclass
-class Message:
-    """Represents a message with sequence number, client identifier, data, version, and x value."""
-    num: int
-    client: str
-    data: bytes
-    v: bytes
-    x: int
-
-
-def read_env_str(name: str, default: str = "") -> str:
-    """Reads an environment variable by name and return value."""
-    return str(os.environ.get(name, default))
-
-
-def read_env_bool(name: str, default: bool = False) -> bool:
-    """Reads an environment variable by name and converts value as boolean."""
-    value = os.environ.get(name, f"{default}").lower()
-    return value in ("true", "on", "ok", "1", "yes")
-
-
-def read_env_float(name: str, default: float = 0.0) -> float:
-    """Reads an environment variable by name and converts value to float."""
-    try:
-        return float(os.environ.get(name, default))
-    except ValueError:
-        return default
-
-
-def read_env_int(name: str, default: int = 0) -> int:
-    """Reads an environment variable by name and converts value to integer."""
-    try:
-        return int(os.environ.get(name, default))
-    except ValueError:
-        return default
-
-
-def read_env_list(name: str, split_with: str = ";", default: list = []) -> list[str]:
-    """Read an environment variable and return its value as a list."""
-    result = []
-    values = read_env_str(name)
-    if values:
-        result.extend(values.split(split_with))
-    else:
-        result.extend(default)
-
-    return result
-
-
-LOG_LEVEL = read_env_str("LOG_LEVEL") or "info"
 SERVER_TCP_TARGET = read_env_list("SERVER_TCP_TARGET")
 SERVER_UDP_TARGET = read_env_list("SERVER_UDP_TARGET")
-BROKER_HOST = read_env_str("BROKER_HOST", "localhost")
-BROKER_USER = read_env_str("BROKER_USER")
-BROKER_PASSWORD = read_env_str("BROKER_PASSWORD")
-BROKER_PORT = read_env_int("BROKER_PORT", 1883)
-STOP_W = "quit"
+
 CLIENTS = read_env_list("CLIENTS", default=["client"])
 RECONNECT_TIMEOUT = read_env_float("RECONNECT_TIMEOUT", 5)
 RECONNECT_ATTEMPT = read_env_int("RECONNECT_ATTEMPT", 30)
-BUFFER_SIZE = read_env_int("READ_BUFFER_SIZE", 1024 * 8)
-WORKERS = read_env_int("WORKERS")
-CONNECTION_IDLE_LIMIT = read_env_int("CONNECTION_IDLE_LIMIT", 300)
-uvloop = read_env_bool("UVLOOP", True)
-use_compress = read_env_bool("COMPRESS", False)
-STAT_FILE = read_env_str("STAT_FILE")
-CRYPTO_KEY = read_env_str("CRYPTO_KEY")
-CRYPTO_ALG = Fernet(CRYPTO_KEY) if CRYPTO_KEY else None
-qos = read_env_int("QOS_LEVEL", 0)
-
-
-def _convert_data(data: bytes) -> bytes:
-    """Compress and encrypt data for transmission."""
-    raw = CRYPTO_ALG.encrypt(data) if CRYPTO_ALG else data
-    return zlib.compress(raw, 9) if use_compress else raw
-
-
-def _restore_data(data: bytes) -> bytes:
-    """Decompress and decrypt data from transmission."""
-    src_data = zlib.decompress(data) if use_compress else data
-    if CRYPTO_ALG:
-        return CRYPTO_ALG.decrypt(src_data)
-    else:
-        return src_data
 
 logger = logging.getLogger(__name__)
 traffic_stats = TTLCache(maxsize=1000, ttl=3600 * 24)
@@ -122,12 +60,6 @@ async def traffic_stats_inc(key: str, val: int = 1):
 
 level = getattr(logging, LOG_LEVEL.upper(), logging.WARNING)
 logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
-if uvloop:
-    try:
-        import uvloop
-        uvloop.install()
-    except Exception as err:
-        logger.critical(err)
 
 
 class UdpProxyProtocol(asyncio.DatagramProtocol):
@@ -163,9 +95,9 @@ class UdpProxyProtocol(asyncio.DatagramProtocol):
         logger.info(f"Data for topic '{topic}' to {len(data)} bytes client {self.connection_id}")
         try:
             if executor:
-                c_data = await loop.run_in_executor(executor, _convert_data, data)
+                c_data = await loop.run_in_executor(executor, make_convert_data, data)
             else:
-                c_data = _convert_data(data)
+                c_data = make_convert_data(data)
 
             msg_content = pickle.dumps(
                 Message(self.index, self.connection_id, c_data, uuid.uuid4().bytes, 0)
@@ -218,6 +150,7 @@ class OutConnectionServer:
     udp_targets: Dict[str, tuple] = {}
     service_check_interval: float = 3.0
     connections: Dict[tuple, Any] = {}
+    short_buffer_size: int = 64
 
     def __init__(self):
         """Initialize the proxy server with target configurations."""
@@ -256,9 +189,9 @@ class OutConnectionServer:
                     continue
 
                 if self._executor:
-                    c_data = await loop.run_in_executor(self._executor, _convert_data, data)
+                    c_data = await loop.run_in_executor(self._executor, make_convert_data, data)
                 else:
-                    c_data = _convert_data(data)
+                    c_data = make_convert_data(data)
 
                 msg_content = pickle.dumps(
                     Message(index, connection_id, c_data, uuid.uuid4().bytes, 0)
@@ -511,48 +444,53 @@ class OutConnectionServer:
 
             if message.payload:
                 try:
-                    msg: Message = pickle.loads(message.payload)
+                    chunk: Chunk = pickle.loads(message.payload)
                 except Exception as err:
                     logger.error(f"Failed to deserialize message: {err}")
                     continue
                 else:
                     await traffic_stats_inc("mqtt_in", len(message.payload))
 
-                route_key = (target, msg.client)
-                self._latest_message[route_key] = datetime.now()
+                chunk.m.sort(key=sort_message)
+                for msg in chunk.m:
+                    route_key = (target, msg.client)
+                    self._latest_message[route_key] = datetime.now()
 
-                queue = None
-                if msg.x:
-                    logger.warning(f"Client {msg.client} requests closing connection in {target}")
-                    if route_key in self._out_routes:
-                        queue = self._out_routes[route_key]
-                        # queue.put_nowait(STOP_W)
-                    continue
+                    queue = None
+                    if msg.x:
+                        logger.warning(f"Client {msg.client} requests closing connection in {target}")
+                        if route_key in self._out_routes:
+                            queue = self._out_routes[route_key]
+                            # queue.put_nowait(STOP_W)
+                        continue
 
-                if route_key not in self._out_routes:
-                    queue = self._out_routes[route_key] = asyncio.Queue()
-                    task = loop.create_task(
-                        (
-                            self.create_target_tcp_connection(target, msg.client, queue)
-                        ) if proto == "tcp" else (
-                            self.create_target_udp_connection(target, msg.client, queue)
+                    if route_key not in self._out_routes:
+                        queue = self._out_routes[route_key] = asyncio.Queue(maxsize=self.short_buffer_size)
+                        task = loop.create_task(
+                            (
+                                self.create_target_tcp_connection(target, msg.client, queue)
+                            ) if proto == "tcp" else (
+                                self.create_target_udp_connection(target, msg.client, queue)
+                            )
                         )
-                    )
-                    self.connections[route_key] = task
-                else:
-                    queue = self._out_routes[route_key]
-
-                try:
-                    if self._executor:
-                        data = await loop.run_in_executor(self._executor, _restore_data, msg.data)
+                        self.connections[route_key] = task
                     else:
-                        data = _restore_data(msg.data)
-                except Exception as err:
-                    logger.error(f"Failed to restore data for client {msg.client} in topic {target}: {err}")
-                    continue
-                else:
-                    msg.data = data
-                    queue.put_nowait(msg)
+                        queue = self._out_routes[route_key]
+
+                    try:
+                        if self._executor:
+                            data = await loop.run_in_executor(self._executor, make_restore_data, msg.data)
+                        else:
+                            data = make_restore_data(msg.data)
+
+                        msg.data = data
+                        queue.put_nowait(msg)
+                    except asyncio.QueueFull:
+                        logger.warning(f"Failed to process connection for {msg.client} in topic {target}")
+                        break
+                    except Exception as err:
+                        logger.error(f"Failed to restore data for client {msg.client} in topic {target}: {err}")
+                        continue
             else:
                 await asyncio.sleep(self._iter_timeout)
 
