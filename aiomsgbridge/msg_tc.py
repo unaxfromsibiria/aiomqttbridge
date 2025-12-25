@@ -197,8 +197,13 @@ class BaseSocketServer:
             await traffic_stats_inc(f"idle_connections_{self._target}", len(connections_to_remove))
             for connection_id in connections_to_remove:
                 if connection_id in self._out_routes:
-                    self._out_routes[connection_id].put_nowait(STOP_W)
-                    await asyncio.sleep(self._iter_timeout)
+                    try:
+                        self._out_routes[connection_id].put_nowait(STOP_W)
+                    except asyncio.QueueFull:
+                        ...
+                    else:
+                        await asyncio.sleep(self._iter_timeout)
+
                     try:
                         del self._out_routes[connection_id]
                     except Exception as err:

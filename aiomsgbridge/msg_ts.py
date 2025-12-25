@@ -127,7 +127,10 @@ class UdpProxyProtocol(asyncio.DatagramProtocol):
     def connection_lost(self, exc):
         logger.info(f"Connection {self.connection_id} lost")
         if self._queue:
-            self._queue.put_nowait(STOP_W)
+            try:
+                self._queue.put_nowait(STOP_W)
+            except asyncio.QueueFull:
+                ...
 
 
 class OutConnectionServer:
