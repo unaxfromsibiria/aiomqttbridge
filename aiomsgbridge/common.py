@@ -1,8 +1,11 @@
+import asyncio
 import os
 import zlib
 from dataclasses import dataclass
+from datetime import datetime
 from warnings import warn as log_warn
 
+from cachetools import TTLCache
 from cryptography.fernet import Fernet
 
 
@@ -66,6 +69,31 @@ def read_env_list(name: str, split_with: str = ";", default: list = []) -> list[
     return result
 
 
+traffic_stats = TTLCache(maxsize=1000, ttl=3600 * 24)
+stat_lock = asyncio.Lock()
+
+
+async def traffic_stats_inc(key: str, val: int = 1):
+    """Increment traffic statistics for a given key."""
+    async with stat_lock:
+        if key in traffic_stats:
+            traffic_stats[key] = traffic_stats[key] + val
+        else:
+            traffic_stats[key] = val
+
+
+async def set_stats_value(key: str, val: float):
+    """Increment traffic statistics for a given key."""
+    async with stat_lock:
+        traffic_stats[key] = val
+
+
+def get_current_stat() -> dict:
+    traffic_stats_dict = dict(traffic_stats)
+    traffic_stats_dict["updated"] = datetime.now().isoformat()
+    return traffic_stats_dict
+
+
 LOG_LEVEL = read_env_str("LOG_LEVEL") or "info"
 BROKER_HOST = read_env_str("BROKER_HOST", "localhost")
 BROKER_USER = read_env_str("BROKER_USER")
@@ -81,6 +109,7 @@ CRYPTO_ALG = Fernet(CRYPTO_KEY) if CRYPTO_KEY else None
 qos = read_env_int("QOS_LEVEL", 0)
 CONNECTION_IDLE_LIMIT = read_env_int("CONNECTION_IDLE_LIMIT", 300)
 STAT_FILE = read_env_str("STAT_FILE")
+CHUNK_COLLECT_DELAY = read_env_float("CHUNK_COLLECT_DELAY", 0.07)
 
 
 if uvloop:

@@ -14,13 +14,13 @@ from typing import Optional
 
 from aiomqtt import Client
 from aiomqtt import ProtocolVersion
-from cachetools import TTLCache
 
 from .common import BROKER_HOST
 from .common import BROKER_PASSWORD
 from .common import BROKER_PORT
 from .common import BROKER_USER
 from .common import BUFFER_SIZE
+from .common import CHUNK_COLLECT_DELAY
 from .common import CONNECTION_IDLE_LIMIT
 from .common import LOG_LEVEL
 from .common import STAT_FILE
@@ -29,51 +29,32 @@ from .common import WORKERS
 from .common import Chunk
 from .common import IndexManager
 from .common import Message
+from .common import get_current_stat
 from .common import make_convert_data
 from .common import make_restore_data
 from .common import qos
-from .common import read_env_float
-from .common import read_env_int
 from .common import read_env_list
 from .common import read_env_str
+from .common import set_stats_value
+from .common import sort_message
+from .common import traffic_stats_inc
 
 CLIENT = read_env_str("CLIENT", "client")
 TCP_SOCKETS = read_env_list("TCP_SOCKETS")
 UDP_SOCKETS = read_env_list("UDP_SOCKETS")
-CHUNK_COLLECT_DELAY = read_env_float("CHUNK_COLLECT_DELAY", 0.075)
 
 # eg TCP_SOCKETS=ssh:localhost:22;web:0.0.0.0:80;postgres:127.0.0.1:5432
 # UDP_SOCKETS=dns:localhost:53;
 
 logger = logging.getLogger(__name__)
-traffic_stats = TTLCache(maxsize=1000, ttl=3600 * 24)
-stat_lock = asyncio.Lock()
-
-
-async def traffic_stats_inc(key: str, val: int = 1):
-    """Increment traffic statistics for a given key."""
-    async with stat_lock:
-        if key in traffic_stats:
-            traffic_stats[key] = traffic_stats[key] + val
-        else:
-            traffic_stats[key] = val
-
-
-async def set_stats_value(key: str, val: float):
-    """Increment traffic statistics for a given key."""
-    async with stat_lock:
-        traffic_stats[key] = val
-
 level = getattr(logging, LOG_LEVEL.upper(), logging.WARNING)
-logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 class ChunkPublisher:
     """
     Publishes chunks of messages via MQTT.
     """
-
-    _warning_size: int = 32
+    _warning_size: int = 50
     _queue: asyncio.Queue
     mqtt_client: Client
     topic: str
@@ -139,7 +120,7 @@ class BaseSocketServer:
     """
 
     _out_routes: Dict[str, asyncio.Queue] = {}
-    _wait_iteration_time: float = 0.08
+    _wait_iteration_time: float = 0.075
     _iter_timeout: float = 0.1
     _mqtt_client = None
     _topoc: str
@@ -150,7 +131,7 @@ class BaseSocketServer:
     _target: str = ""
     _port: int = 0
     _host: str = ""
-    short_buffer_size: int = 32
+    short_buffer_size: int = 2048
     index: IndexManager
     pub: ChunkPublisher
 
@@ -560,9 +541,7 @@ class LocalConnectionServer:
 
             try:
                 with open(STAT_FILE, "w") as json_file:
-                    traffic_stats_dict = dict(traffic_stats)
-                    traffic_stats_dict["updated"] = datetime.now().isoformat()
-                    json.dump(traffic_stats_dict, json_file, indent=2)
+                    json.dump(get_current_stat(), json_file, indent=2)
             except Exception as err:
                 logger.error(f"Problem {err} in saving statistic into '{STAT_FILE}'")
 
@@ -584,57 +563,63 @@ class LocalConnectionServer:
             return
 
         async for message in self._mqtt_client.messages:
-            if message.payload:
-                try:
-                    msg: Message = pickle.loads(message.payload)
-                except Exception as err:
-                    logger.error(f"Failed to deserialize message: {err}")
-                    continue
+            if not message.payload:
+                await asyncio.sleep(self._iter_timeout)
+                continue
 
-                sock_server = None
-                topic = message.topic.value
-                for target, server in self.sockets.items():
-                    if server.res_topic == topic or server.res_topic in topic:
-                        sock_server = server
-                        break
+            try:
+                chunk: Chunk = pickle.loads(message.payload)
+            except Exception as err:
+                logger.error(f"Failed to deserialize message: {err}")
+                continue
 
+            sock_server = None
+            topic = message.topic.value
+            for target, server in self.sockets.items():
+                if server.res_topic == topic or server.res_topic in topic:
+                    sock_server = server
+                    break
+
+            chunk.m.sort(key=sort_message)
+            for msg in chunk.m:
                 if msg.x:
                     logger.warning(f"Client {msg.client} closing connection")
+
                 await traffic_stats_inc(f"mqtt_in_{target}", len(message.payload))
-                if sock_server.has_client(msg.client):
-                    if msg.x:
-                        try:
-                            sock_server.put_client_message(msg.client, STOP_W)
-                            # self._closig[msg.client] = datetime.now()
-                        except asyncio.QueueFull:
-                            logger.warning(f"Failed to send STOP_W to client {msg.client}.")
-                        except Exception as err:
-                            logger.error(f"Failed to send STOP_W to client {msg.client}: {err}")
-                        else:
-                            logger.warning(f"Sending quit to {msg.client}")
+                if not sock_server.has_client(msg.client):
+                    continue
 
-                        continue
-
+                if msg.x:
                     try:
-                        if self._executor:
-                            data = await loop.run_in_executor(self._executor, make_restore_data, msg.data)
-                        else:
-                            data = make_restore_data(msg.data)
-                        msg.data = data
-                    except Exception as err:
-                        logger.error(f"Failed to restore data for client {msg.client}: {err}")
-                        continue
-
-                    try:
-                        sock_server.put_client_message(msg.client, msg)
+                        sock_server.put_client_message(msg.client, STOP_W)
+                        # self._closig[msg.client] = datetime.now()
                     except asyncio.QueueFull:
-                        logger.warning(f"Failed to put message in queue for client {msg.client}")
+                        logger.warning(f"Failed to send STOP_W to client {msg.client}.")
                     except Exception as err:
-                        logger.error(f"Failed to put message in queue for client {msg.client}: {err}")
-                        # Remove the client from routes if queue is broken
-                        sock_server.del_client_route(msg.client)
-            else:
-                await asyncio.sleep(self._iter_timeout)
+                        logger.error(f"Failed to send STOP_W to client {msg.client}: {err}")
+                    else:
+                        logger.warning(f"Sending quit to {msg.client}")
+
+                    continue
+
+                try:
+                    if self._executor:
+                        data = await loop.run_in_executor(self._executor, make_restore_data, msg.data)
+                    else:
+                        data = make_restore_data(msg.data)
+                    msg.data = data
+                except Exception as err:
+                    logger.error(f"Failed to restore data for client {msg.client}: {err}")
+                    continue
+
+                try:
+                    sock_server.put_client_message(msg.client, msg)
+                except asyncio.QueueFull:
+                    logger.warning(f"Failed to put message in queue for client {msg.client}")
+                except Exception as err:
+                    logger.error(f"Failed to put message in queue for client {msg.client}: {err}")
+                    # Remove the client from routes if queue is broken
+                    sock_server.del_client_route(msg.client)
 
         logger.warning("Closed topics")
         self._wait = False
