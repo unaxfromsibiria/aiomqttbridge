@@ -10,6 +10,7 @@ from datetime import datetime
 from time import monotonic
 from typing import Any
 from typing import Dict
+from typing import Iterable
 from typing import List
 from typing import Optional
 
@@ -62,18 +63,12 @@ class PublishManager:
     mqtt_client: Client
     index: IndexManager
     _wait: bool = True
-    _min_delay = 0.003
+    _min_delay = 0.004
     _warning_size: int = 96
 
     def send(self, topic: str, msg: Message):
         """Send a message to the internal queue for publishing."""
-        if topic in self.topic_queue:
-            queue = self.topic_queue[topic]
-        else:
-            queue = asyncio.Queue()
-            self.topic_queue[topic] = queue
-
-        queue.put_nowait(msg)
+        self.topic_queue[topic].put_nowait(msg)
 
     def __init__(self, mqtt_client: Client, executor: Optional[ProcessPoolExecutor]):
         """Initialize service."""
@@ -87,7 +82,7 @@ class PublishManager:
     def close(self):
         self._wait = False
 
-    async def process(self):
+    async def process(self, topic: str):
         """Process and publish messages in chunks."""
         wait = True
         limit = CHUNK_COLLECT_DELAY
@@ -95,54 +90,45 @@ class PublishManager:
         executor = self.executor
         loop = asyncio.get_event_loop()
         min_delay = self._min_delay
+        self.topic_queue[topic] = queue = asyncio.Queue()
+        logger.info(f"Starting output queue for {topic}.")
 
-        chunks: dict[str, Chunk] = {}
-        for_topics = []
         while wait:
-            chunks.clear()
+            chunk = Chunk([], self.index.get())
             start = monotonic()
             while monotonic() - start < limit:
-                for_topics.extend(self.topic_queue.items())
-                for topic, queue in for_topics:
-                    try:
-                        msg: Message = await asyncio.wait_for(queue.get(), timeout=min_delay)
-                    except asyncio.TimeoutError:
-                        continue
-                    else:
-                        if msg.x == 0:
-                            if executor:
-                                c_data = await loop.run_in_executor(executor, make_convert_data, msg.data)
-                            else:
-                                c_data = make_convert_data(msg.data)
-
-                            msg.data = c_data
-
-                        if topic in chunks:
-                            chunks[topic].m.append(msg)
+                try:
+                    msg: Message = await asyncio.wait_for(queue.get(), timeout=min_delay)
+                except asyncio.TimeoutError:
+                    continue
+                else:
+                    if msg.x == 0:
+                        if executor:
+                            c_data = await loop.run_in_executor(executor, make_convert_data, msg.data)
                         else:
-                            chunks[topic] = Chunk([msg], 0)
+                            c_data = make_convert_data(msg.data)
 
-                for_topics.clear()
+                        msg.data = c_data
 
-            if not chunks:
+                    chunk.m.append(msg)
+
+            if not chunk.m:
                 await asyncio.sleep(min_delay)
                 continue
 
-            for topic, chunk in chunks.items():
-                if len(chunk.m) > self._warning_size:
-                    logger.warning(f"Too many output data in '{topic}' buffer: {len(chunk.m)}")
+            if len(chunk.m) > self._warning_size:
+                logger.warning(f"Too many output data in '{topic}' buffer: {len(chunk.m)}")
 
-                chunk.i = self.index.get()
-                data = pickle.dumps(chunk)
-                mid_ch_size = (mid_ch_size + len(chunk.m)) / 2
+            data = pickle.dumps(chunk)
+            mid_ch_size = (mid_ch_size + len(chunk.m)) / 2
 
-                try:
-                    await self.mqtt_client.publish(topic, payload=data, qos=qos)
-                except Exception as err:
-                    logger.error(f"Client {topic} lost data in {chunk.i}: {err}")
-                    await asyncio.sleep(min_delay)
-                else:
-                    await traffic_stats_inc(f"output_topic_{topic}", len(data))
+            try:
+                await self.mqtt_client.publish(topic, payload=data, qos=qos)
+            except Exception as err:
+                logger.error(f"Client {topic} lost data in {chunk.i}: {err}")
+                await asyncio.sleep(min_delay)
+            else:
+                await traffic_stats_inc(f"output_topic_{topic}", len(data))
 
             wait = self._wait
             await set_stats_value(f"mean_chunk_{topic}", mid_ch_size)
@@ -607,6 +593,13 @@ class OutConnectionServer:
                 except Exception as err:
                     logger.error(f"Problem {err} to save statistic into '{STAT_FILE}'")
 
+    def all_data_topics(self) -> Iterable[str]:
+        """Generate all topics for client data."""
+        for tg in self.tcp_targets:
+            yield self._out_topic_tpl.format(tg)
+        for tg in self.udp_targets:
+            yield self._out_topic_tpl.format(tg)
+
     async def start_server(self, executor: Optional[ProcessPoolExecutor] = None):
         """
         Start the proxy server and begin processing connections.
@@ -626,9 +619,11 @@ class OutConnectionServer:
             self._mqtt_client = client
             self.pub = PublishManager(client, executor)
             logger.info(f"Connection to broker {BROKER_HOST}")
-            tasks.append(loop.create_task(self.wait_messages()))
             tasks.append(loop.create_task(self.service_process()))
-            tasks.append(loop.create_task(self.pub.process()))
+            for topic in self.all_data_topics():
+                tasks.append(loop.create_task(self.pub.process(topic)))
+
+            tasks.append(loop.create_task(self.wait_messages()))
             _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)            
             # Cancel remaining tasks
             for task in pending:

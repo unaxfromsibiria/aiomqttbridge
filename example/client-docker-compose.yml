@@ -9,6 +9,8 @@ services:
       BROKER_HOST: "<your server>"
       BROKER_PORT: 1883
       BROKER_USER: connection
+      WORKERS: 0
+      CLIENT: example
       STAT_FILE: stat.json
       TCP_SOCKETS: "iperf-tcp:0.0.0.0:9091;http:0.0.0.0:9090"
       UDP_SOCKETS: "iperf-udp:0.0.0.0:9092;dns:0.0.0.0:5553"

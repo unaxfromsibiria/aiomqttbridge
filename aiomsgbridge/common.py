@@ -109,7 +109,7 @@ CRYPTO_ALG = Fernet(CRYPTO_KEY) if CRYPTO_KEY else None
 qos = read_env_int("QOS_LEVEL", 0)
 CONNECTION_IDLE_LIMIT = read_env_int("CONNECTION_IDLE_LIMIT", 300)
 STAT_FILE = read_env_str("STAT_FILE")
-CHUNK_COLLECT_DELAY = read_env_float("CHUNK_COLLECT_DELAY", 0.07)
+CHUNK_COLLECT_DELAY = read_env_float("CHUNK_COLLECT_DELAY", 0.065)
 
 
 if uvloop:
