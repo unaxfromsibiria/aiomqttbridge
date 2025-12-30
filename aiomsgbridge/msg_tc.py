@@ -1,6 +1,5 @@
 import asyncio
 import hashlib
-import json
 import logging
 import pickle
 import uuid
@@ -23,18 +22,17 @@ from .common import BUFFER_SIZE
 from .common import CHUNK_COLLECT_DELAY
 from .common import CONNECTION_IDLE_LIMIT
 from .common import LOG_LEVEL
-from .common import STAT_FILE
 from .common import STOP_W
 from .common import WORKERS
 from .common import Chunk
 from .common import IndexManager
 from .common import Message
-from .common import get_current_stat
 from .common import make_convert_data
 from .common import make_restore_data
 from .common import qos
 from .common import read_env_list
 from .common import read_env_str
+from .common import save_stat
 from .common import set_stats_value
 from .common import sort_message
 from .common import traffic_stats_inc
@@ -420,6 +418,7 @@ class LocalConnectionServer:
     service_check_interval: float = 3.0
     _iter_timeout: float = 0.0050
     _wait: bool = True
+    _mqtt_client = None
 
     async def make_udp_server(self, new_server: UdpSocketServer):
         """
@@ -464,11 +463,9 @@ class LocalConnectionServer:
             new_server.server = server
             await server.serve_forever()
 
-    async def start_server(self, executor: Optional[ProcessPoolExecutor] = None):
-        """Start the proxy server with configured target sockets."""
-        self._executor = executor
-        self.sockets = {}
-        handlers = []
+    async def connect(self):
+        """Create connection to broker."""
+        wait = True
         async with Client(
             hostname=BROKER_HOST,
             port=BROKER_PORT,
@@ -477,56 +474,67 @@ class LocalConnectionServer:
             protocol=ProtocolVersion.V5,
         ) as client:
             self._mqtt_client = client
+            while wait:
+                await asyncio.sleep(self._iter_timeout)
+                wait = self._wait
 
-            all_codes = set()
-            for target_socket in TCP_SOCKETS:
-                parts = target_socket.split(":")
-                try:
-                    target_code, t_host, t_port = parts
-                    assert target_code
-                    all_codes.add(target_code)
-                    assert t_host
-                    t_port = int(t_port)
-                    assert 1 <= t_port <= 2 ** 16
-                except Exception as err:
-                    raise ValueError(
-                        f"Incorrect targets in env 'TCP_SOCKETS': {parts} ({err})"
-                        " format: 'target_code1:host:port;target_code2:host:port'"
-                    )
+    async def start_server(self, executor: Optional[ProcessPoolExecutor] = None):
+        """Start the proxy server with configured target sockets."""
+        self._executor = executor
+        self.sockets = {}
+        handlers = []
+        all_codes = set()
+        while self._mqtt_client is None:
+            await asyncio.sleep(self._iter_timeout)
 
-                server = TcpSocketServer(client, executor, target_code, t_host, t_port)
-                self.sockets[target_code] = server
-                handlers.append(self.make_tcp_server(server))
-                handlers.append(server.pub.process())
+        for target_socket in TCP_SOCKETS:
+            parts = target_socket.split(":")
+            try:
+                target_code, t_host, t_port = parts
+                assert target_code
+                all_codes.add(target_code)
+                assert t_host
+                t_port = int(t_port)
+                assert 1 <= t_port <= 2 ** 16
+            except Exception as err:
+                raise ValueError(
+                    f"Incorrect targets in env 'TCP_SOCKETS': {parts} ({err})"
+                    " format: 'target_code1:host:port;target_code2:host:port'"
+                )
 
-            for target_socket in UDP_SOCKETS:
-                parts = target_socket.split(":")
-                try:
-                    target_code, t_host, t_port = parts
-                    assert target_code
-                    assert t_host
-                    t_port = int(t_port)
-                    assert 1 <= t_port <= 2 ** 16
-                except Exception as err:
-                    raise ValueError(
-                        f"Incorrect targets in env 'UDP_SOCKETS': {parts} ({err})"
-                        " format: 'target_code1:host:port;target_code2:host:port'"
-                    )
+            server = TcpSocketServer(self._mqtt_client, executor, target_code, t_host, t_port)
+            self.sockets[target_code] = server
+            handlers.append(self.make_tcp_server(server))
+            handlers.append(server.pub.process())
 
-                if target_code in all_codes:
-                    raise ValueError(
-                        f"Use different service codes for TCP and UDP targets ({target_code} in tcp-list)"
-                    )
+        for target_socket in UDP_SOCKETS:
+            parts = target_socket.split(":")
+            try:
+                target_code, t_host, t_port = parts
+                assert target_code
+                assert t_host
+                t_port = int(t_port)
+                assert 1 <= t_port <= 2 ** 16
+            except Exception as err:
+                raise ValueError(
+                    f"Incorrect targets in env 'UDP_SOCKETS': {parts} ({err})"
+                    " format: 'target_code1:host:port;target_code2:host:port'"
+                )
 
-                server = UdpSocketServer(client, executor, target_code, t_host, t_port)
-                self.sockets[target_code] = server
-                handlers.append(self.make_udp_server(server))
-                handlers.append(server.pub.process())
+            if target_code in all_codes:
+                raise ValueError(
+                    f"Use different service codes for TCP and UDP targets ({target_code} in tcp-list)"
+                )
 
-            if handlers:
-                handlers.append(self.wait_messages())
-                handlers.append(self.service_process())
-                await asyncio.gather(*handlers)
+            server = UdpSocketServer(self._mqtt_client, executor, target_code, t_host, t_port)
+            self.sockets[target_code] = server
+            handlers.append(self.make_udp_server(server))
+            handlers.append(server.pub.process())
+
+        if handlers:
+            handlers.append(self.wait_messages())
+            handlers.append(self.service_process())
+            await asyncio.gather(*handlers)
 
     async def service_process(self):
         """Periodically clean up connections and save traffic statistics."""
@@ -535,15 +543,7 @@ class LocalConnectionServer:
             for _, server in self.sockets.items():
                 await server.claen_up()
 
-            # save satistic
-            if not STAT_FILE:
-                continue
-
-            try:
-                with open(STAT_FILE, "w") as json_file:
-                    json.dump(get_current_stat(), json_file, indent=2)
-            except Exception as err:
-                logger.error(f"Problem {err} in saving statistic into '{STAT_FILE}'")
+            await save_stat(logger)
 
     async def wait_messages(self):
         """Wait for and process incoming MQTT messages."""
@@ -634,6 +634,7 @@ async def main():
     Starts the TCP/UDP connection server with optional process pool execution.
     """
     server = LocalConnectionServer()
+    asyncio.create_task(server.connect())
     if WORKERS > 0:
         with ProcessPoolExecutor(max_workers=WORKERS) as executor:
             await server.start_server(executor)

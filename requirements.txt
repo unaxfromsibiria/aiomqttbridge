@@ -2,3 +2,4 @@ uvloop
 cryptography
 cachetools
 aiomqtt
+aiofiles

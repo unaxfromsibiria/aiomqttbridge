@@ -25,19 +25,18 @@ from .common import BUFFER_SIZE
 from .common import CHUNK_COLLECT_DELAY
 from .common import CONNECTION_IDLE_LIMIT
 from .common import LOG_LEVEL
-from .common import STAT_FILE
 from .common import STOP_W
 from .common import WORKERS
 from .common import Chunk
 from .common import IndexManager
 from .common import Message
-from .common import get_current_stat
 from .common import make_convert_data
 from .common import make_restore_data
 from .common import qos
 from .common import read_env_float
 from .common import read_env_int
 from .common import read_env_list
+from .common import save_stat
 from .common import set_stats_value
 from .common import sort_message
 from .common import traffic_stats_inc
@@ -195,7 +194,7 @@ class OutConnectionServer:
     service_check_interval: float = 3.0
     connections: Dict[tuple, Any] = {}
     short_buffer_size: int = 512
-    pub: PublishManager
+    pub: PublishManager = None
 
     def __init__(self):
         """Initialize the proxy server with target configurations."""
@@ -585,13 +584,8 @@ class OutConnectionServer:
                         del self._latest_message[connection_key]
                     except Exception as err:
                         logger.error(f"Error removing latest_message for connection {connection_key}: {err}")
-            # save satistic
-            if STAT_FILE:
-                try:
-                    with open(STAT_FILE, "w") as json_file:
-                        json.dump(get_current_stat(), json_file, indent=2)
-                except Exception as err:
-                    logger.error(f"Problem {err} to save statistic into '{STAT_FILE}'")
+
+            await save_stat(logger)
 
     def all_data_topics(self) -> Iterable[str]:
         """Generate all topics for client data."""
@@ -599,6 +593,23 @@ class OutConnectionServer:
             yield self._out_topic_tpl.format(tg)
         for tg in self.udp_targets:
             yield self._out_topic_tpl.format(tg)
+
+    async def connect(self):
+        """Keep mqtt connection."""
+        wait = True
+        async with Client(
+            hostname=BROKER_HOST,
+            port=BROKER_PORT,
+            username=BROKER_USER,
+            password=BROKER_PASSWORD,
+            protocol=ProtocolVersion.V5,
+        ) as client:
+            self._mqtt_client = client
+            self.pub = PublishManager(client, self._executor)
+            logger.info(f"Connection to broker {BROKER_HOST}")
+            while wait:
+                await asyncio.sleep(self._iter_timeout)
+                wait = self.pub._wait
 
     async def start_server(self, executor: Optional[ProcessPoolExecutor] = None):
         """
@@ -609,30 +620,24 @@ class OutConnectionServer:
         self._executor = executor
         loop = asyncio.get_event_loop()
         tasks = []
-        async with Client(
-            hostname=BROKER_HOST,
-            port=BROKER_PORT,
-            username=BROKER_USER,
-            password=BROKER_PASSWORD,
-            protocol=ProtocolVersion.V5,
-        ) as client:
-            self._mqtt_client = client
-            self.pub = PublishManager(client, executor)
-            logger.info(f"Connection to broker {BROKER_HOST}")
-            tasks.append(loop.create_task(self.service_process()))
-            for topic in self.all_data_topics():
-                tasks.append(loop.create_task(self.pub.process(topic)))
+        tasks.append(loop.create_task(self.connect()))
+        tasks.append(loop.create_task(self.service_process()))
+        while self.pub is None:
+            await asyncio.sleep(self._iter_timeout)
 
-            tasks.append(loop.create_task(self.wait_messages()))
-            _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)            
-            # Cancel remaining tasks
-            for task in pending:
-                self.pub.close()
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        for topic in self.all_data_topics():
+            tasks.append(loop.create_task(self.pub.process(topic)))
+
+        tasks.append(loop.create_task(self.wait_messages()))
+        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)            
+        # Cancel remaining tasks
+        for task in pending:
+            self.pub.close()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 async def main():

@@ -1,10 +1,13 @@
 import asyncio
+import json
+import logging
 import os
 import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from warnings import warn as log_warn
 
+import aiofiles
 from cachetools import TTLCache
 from cryptography.fernet import Fernet
 
@@ -110,6 +113,19 @@ qos = read_env_int("QOS_LEVEL", 0)
 CONNECTION_IDLE_LIMIT = read_env_int("CONNECTION_IDLE_LIMIT", 300)
 STAT_FILE = read_env_str("STAT_FILE")
 CHUNK_COLLECT_DELAY = read_env_float("CHUNK_COLLECT_DELAY", 0.065)
+
+
+async def save_stat(logger: logging.Logger):
+    """Record statistic"""
+    if not STAT_FILE:
+        return
+
+    # save satistic
+    try:
+        async with aiofiles.open(STAT_FILE, "w") as json_file:
+            await json_file.write(json.dumps(get_current_stat(), indent=2))
+    except Exception as err:
+        logger.error(f"Problem {err} in saving statistic into '{STAT_FILE}'")
 
 
 if uvloop:
