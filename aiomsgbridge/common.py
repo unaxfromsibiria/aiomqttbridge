@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import tracemalloc
 import zlib
 from dataclasses import dataclass
 from datetime import datetime
@@ -91,12 +92,6 @@ async def set_stats_value(key: str, val: float):
         traffic_stats[key] = val
 
 
-def get_current_stat() -> dict:
-    traffic_stats_dict = dict(traffic_stats)
-    traffic_stats_dict["updated"] = datetime.now().isoformat()
-    return traffic_stats_dict
-
-
 LOG_LEVEL = read_env_str("LOG_LEVEL") or "info"
 BROKER_HOST = read_env_str("BROKER_HOST", "localhost")
 BROKER_USER = read_env_str("BROKER_USER")
@@ -112,7 +107,26 @@ CRYPTO_ALG = Fernet(CRYPTO_KEY) if CRYPTO_KEY else None
 qos = read_env_int("QOS_LEVEL", 0)
 CONNECTION_IDLE_LIMIT = read_env_int("CONNECTION_IDLE_LIMIT", 300)
 STAT_FILE = read_env_str("STAT_FILE")
+MEMORY_STAT = read_env_bool("MEMORY_STAT", True)
 CHUNK_COLLECT_DELAY = read_env_float("CHUNK_COLLECT_DELAY", 0.065)
+
+
+if STAT_FILE and MEMORY_STAT:
+    tracemalloc.start()
+
+
+def get_current_stat() -> dict:
+    """Create dict with the service current statistic values."""
+    traffic_stats_dict = dict(traffic_stats)
+    traffic_stats_dict["updated"] = datetime.now().isoformat()
+    coroutines_count = sum(1 for _ in asyncio.all_tasks())
+    traffic_stats_dict["coroutines"] = coroutines_count
+    if MEMORY_STAT:
+        current, peak = tracemalloc.get_traced_memory()
+        traffic_stats_dict["memory"] = (
+            f"current: {current / 1024 ** 2:.2f} mb; peak: {peak / 1024 ** 2:.2f} mb"
+        )
+    return traffic_stats_dict
 
 
 async def save_stat(logger: logging.Logger):

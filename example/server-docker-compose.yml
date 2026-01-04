@@ -12,6 +12,7 @@ services:
       CLIENTS: example
       SERVER_TCP_TARGET: "http:squid-server:3128;iperf-tcp:0.0.0.0:9091"
       SERVER_UDP_TARGET: "iperf-udp:0.0.0.0:9092;dns:8.8.8.8:53"
+      MEMORY_STAT: off
       STAT_FILE: stat.json
     restart: unless-stopped
 

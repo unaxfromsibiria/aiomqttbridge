@@ -49,9 +49,7 @@ level = getattr(logging, LOG_LEVEL.upper(), logging.WARNING)
 
 
 class ChunkPublisher:
-    """
-    Publishes chunks of messages via MQTT.
-    """
+    """Publishes chunks of messages via MQTT."""
     _warning_size: int = 50
     _queue: asyncio.Queue
     mqtt_client: Client
