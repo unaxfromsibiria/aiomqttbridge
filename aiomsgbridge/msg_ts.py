@@ -420,6 +420,7 @@ class OutConnectionServer:
                 reconnect = True
                 continue
             else:
+                wait = False
                 logger.info(f"Connected to '{t_name}' ({target_host}:{target_port})")
                 reconnect = False
                 attempt_count = 0  # Reset attempt count on successful connection
