@@ -45,7 +45,7 @@ SERVER_UDP_TARGET = read_env_list("SERVER_UDP_TARGET")
 
 CLIENTS = read_env_list("CLIENTS", default=["client"])
 RECONNECT_TIMEOUT = read_env_float("RECONNECT_TIMEOUT", 5)
-RECONNECT_ATTEMPT = read_env_int("RECONNECT_ATTEMPT", 30)
+RECONNECT_ATTEMPT = read_env_int("RECONNECT_ATTEMPT", 10)
 
 logger = logging.getLogger(__name__)
 level = getattr(logging, LOG_LEVEL.upper(), logging.WARNING)
@@ -61,7 +61,7 @@ class PublishManager:
     mqtt_client: Client
     index: IndexManager
     _wait: bool = True
-    _min_delay = 0.004
+    _min_delay = 0.005
     _warning_size: int = 96
 
     def send(self, topic: str, msg: Message):
@@ -180,9 +180,11 @@ class OutConnectionServer:
     and cleanup of idle connections.
     """
 
+    short_buffer_size: int = 512
+    service_check_interval: float = 5.0
     _out_routes: Dict[tuple, asyncio.Queue] = {}
-    _wait_iteration_time: float = 0.08
-    _iter_timeout: float = 0.12
+    _wait_iteration_time: float = 0.09
+    _iter_timeout: float = 0.14
     _mqtt_client = None
     _topics: List[str]
     _out_topic_tpl: str
@@ -190,9 +192,7 @@ class OutConnectionServer:
     _latest_message: Dict[tuple, datetime] = {}
     tcp_targets: Dict[str, tuple] = {}
     udp_targets: Dict[str, tuple] = {}
-    service_check_interval: float = 3.0
     connections: Dict[tuple, Any] = {}
-    short_buffer_size: int = 512
     pub: PublishManager = None
 
     def __init__(self):
@@ -220,25 +220,26 @@ class OutConnectionServer:
         Reads data from TCP connection, converts it, and publishes to MQTT topic.
         Handles errors and connection closure gracefully.
         """
-        index = 1
+        index = 0
         wait = True
         topic = self._out_topic_tpl.format(target)
         while wait:
             try:
                 data = await reader.read(BUFFER_SIZE)
+                index += 1
                 if not data:
                     wait = False
                     continue
 
                 await traffic_stats_inc("tcp_in", len(data))
                 msg = Message(index, connection_id, data, uuid.uuid4().bytes, 0)
-                index += 1
             except Exception as err:
                 logger.error(f"Error in handle read connection: {err}")
-                msg = Message(index, connection_id, b"", b"", 1)
                 wait = False
-
-            self.pub.send(topic, msg)
+                self.pub.send(topic, Message(index, connection_id, b"", b"", 1))
+                continue
+            else:
+                self.pub.send(topic, msg)
 
     async def _process_writer(self, writer: asyncio.StreamWriter, queue: asyncio.Queue):
         """
@@ -374,6 +375,11 @@ class OutConnectionServer:
                     continue
 
                 self._latest_message[msg.client] = datetime.now()
+                if msg.x:
+                    quit_cmd = True
+                    logger.info(f"Closing udp {target} {connection_id} by request")
+                    continue
+
                 try:
                     transport.sendto(msg.data)
                     await traffic_stats_inc("udp_out", len(msg.data))
@@ -419,27 +425,30 @@ class OutConnectionServer:
                 logger.error(f"Failed to connect to '{t_name}': {err}")
                 reconnect = True
                 continue
-            else:
-                wait = False
-                logger.info(f"Connected to '{t_name}' ({target_host}:{target_port})")
-                reconnect = False
-                attempt_count = 0  # Reset attempt count on successful connection
-                tasks = [
-                    loop.create_task(self._process_reader(target_reader, target, connection_id)),
-                    loop.create_task(self._process_writer(target_writer, queue)),
-                ]
 
-            if tasks:
-                _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                # Cancel remaining tasks
-                for task in pending:
+            wait = reconnect = False
+            logger.info(f"Connected to '{t_name}' ({target_host}:{target_port})")
+
+            tasks = [
+                loop.create_task(self._process_reader(target_reader, target, connection_id)),
+                loop.create_task(self._process_writer(target_writer, queue)),
+            ]
+
+            _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            # Cancel remaining tasks
+            for task in pending:
+                try:
                     task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-                logger.info(f"Connection to '{t_name}' closed")
+            try:
+                target_writer.close()
+            except Exception as err:
+                logger.error(f"Failed to close '{t_name}' {connection_id}: {err}")
+            else:
+                logger.info(f"Connection to '{t_name}' closed for {connection_id}")
 
     async def wait_messages(self):
         """
@@ -491,7 +500,13 @@ class OutConnectionServer:
                         logger.warning(f"Client {msg.client} requests closing connection in {target}")
                         if route_key in self._out_routes:
                             queue = self._out_routes[route_key]
-                            # queue.put_nowait(STOP_W)
+                            try:
+                                queue.put_nowait(STOP_W)
+                            except Exception as err:
+                                logger.warning(f"Using client {route_key} queue error: {err}")
+                            else:
+                                await asyncio.sleep(self._iter_timeout)
+
                         continue
 
                     if route_key not in self._out_routes:
@@ -549,7 +564,7 @@ class OutConnectionServer:
 
             if connections_to_remove:
                 con_list = ", ".join(k for _, k in connections_to_remove)
-                logger.warning(f"Closing {len(connections_to_remove)} '{conn_code}' connections: {con_list}")
+                logger.info(f"Closing {len(connections_to_remove)} '{conn_code}' connections: {con_list}")
                 await traffic_stats_inc("idle_connections", len(connections_to_remove))
 
             for connection_key in connections_to_remove:
@@ -564,8 +579,19 @@ class OutConnectionServer:
                             pass
                         except Exception as err:
                             logger.error(f"Error canceling task for connection {connection_key}: {err}")
+
                 # Remove from queues
                 if connection_key in self._out_routes:
+                    queue = self._out_routes.get(connection_key)
+                    if queue:
+                        try:
+                            queue.put_nowait(STOP_W)
+                        except Exception as err:
+                            logger.warning(f"Closing client {connection_key} queue error: {err}")
+                        else:
+                            await asyncio.sleep(self._iter_timeout)
+                            queue.task_done()
+
                     try:
                         del self._out_routes[connection_key]
                     except Exception as err:
@@ -586,6 +612,7 @@ class OutConnectionServer:
                         logger.error(f"Error removing latest_message for connection {connection_key}: {err}")
 
             await save_stat(logger)
+            wait = self.pub._wait
 
     def all_data_topics(self) -> Iterable[str]:
         """Generate all topics for client data."""

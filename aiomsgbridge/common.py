@@ -105,10 +105,10 @@ use_compress = read_env_bool("COMPRESS", False)
 CRYPTO_KEY = read_env_str("CRYPTO_KEY")
 CRYPTO_ALG = Fernet(CRYPTO_KEY) if CRYPTO_KEY else None
 qos = read_env_int("QOS_LEVEL", 0)
-CONNECTION_IDLE_LIMIT = read_env_int("CONNECTION_IDLE_LIMIT", 300)
+CONNECTION_IDLE_LIMIT = read_env_int("CONNECTION_IDLE_LIMIT", 60 * 8)
 STAT_FILE = read_env_str("STAT_FILE")
-MEMORY_STAT = read_env_bool("MEMORY_STAT", True)
-CHUNK_COLLECT_DELAY = read_env_float("CHUNK_COLLECT_DELAY", 0.065)
+MEMORY_STAT = read_env_bool("MEMORY_STAT", False)
+CHUNK_COLLECT_DELAY = read_env_float("CHUNK_COLLECT_DELAY", 0.06)
 
 
 if STAT_FILE and MEMORY_STAT:

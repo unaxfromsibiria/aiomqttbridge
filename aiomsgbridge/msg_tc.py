@@ -50,7 +50,7 @@ level = getattr(logging, LOG_LEVEL.upper(), logging.WARNING)
 
 class ChunkPublisher:
     """Publishes chunks of messages via MQTT."""
-    _warning_size: int = 50
+    _warning_size: int = 96
     _queue: asyncio.Queue
     mqtt_client: Client
     topic: str
@@ -117,7 +117,7 @@ class BaseSocketServer:
 
     _out_routes: Dict[str, asyncio.Queue] = {}
     _wait_iteration_time: float = 0.075
-    _iter_timeout: float = 0.1
+    _iter_timeout: float = 0.12
     _mqtt_client = None
     _topoc: str
     res_topic: str
@@ -180,6 +180,7 @@ class BaseSocketServer:
                         ...
                     else:
                         await asyncio.sleep(self._iter_timeout)
+                        self._out_routes[connection_id].task_done()
 
                     try:
                         del self._out_routes[connection_id]
@@ -288,9 +289,9 @@ class TcpSocketServer(BaseSocketServer):
         """Send data from client to server via MQTT."""
         wait = True
         loop = asyncio.get_event_loop()
+        index = 0
 
         while wait:
-
             try:
                 data = await reader.read(BUFFER_SIZE)
             except Exception as err:
@@ -313,19 +314,20 @@ class TcpSocketServer(BaseSocketServer):
             self.pub.send(Message(index, client, c_data, uuid.uuid4().bytes, 0))
             await traffic_stats_inc(f"mqtt_out_{self._target}", len(c_data) + 32)
 
-    async def send_to_client(self, queue: asyncio.Queue, writer: asyncio.StreamWriter):
+    async def send_to_client(self, client: str, queue: asyncio.Queue, writer: asyncio.StreamWriter):
         """Send data from server to client."""
         quit_cmd = False
         iter_time = self._wait_iteration_time
         while not quit_cmd:
             try:
-                msg = await asyncio.wait_for(queue.get(), timeout=iter_time)
+                msg: Message = await asyncio.wait_for(queue.get(), timeout=iter_time)
             except asyncio.TimeoutError:
                 msg = None
 
             if msg:
                 if isinstance(msg, str) and msg == STOP_W:
                     quit_cmd = True
+                    logger.info(f"Closing client {client} by request")
                     continue
 
                 self._latest_message[msg.client] = datetime.now()
@@ -334,12 +336,12 @@ class TcpSocketServer(BaseSocketServer):
                     await writer.drain()
                     await traffic_stats_inc(f"tcp_out_{self._target}", len(msg.data))
                 except Exception as err:
-                    logger.error(f"Error in handle read connection: {err}")
+                    logger.error(f"Error in handle read connection {client}: {err}")
                     quit_cmd = True
             else:
                 await asyncio.sleep(self._iter_timeout)
 
-    async def handle_client(self, client_reader, client_writer):
+    async def handle_client(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
         """Handle client connection and bidirectional data transfer."""
         client = hashlib.sha1(f"client:{id(client_writer)}".encode()).hexdigest()
         await traffic_stats_inc(f"new_connection_{self._target}")
@@ -354,7 +356,7 @@ class TcpSocketServer(BaseSocketServer):
 
             # Create tasks to handle bidirectional data transfer
             tasks = [
-                asyncio.create_task(self.send_to_client(queue, client_writer)),
+                asyncio.create_task(self.send_to_client(client, queue, client_writer)),
                 asyncio.create_task(self.send_to_server(client, client_reader)),
             ]
             # Wait for both tasks to complete
@@ -372,10 +374,10 @@ class TcpSocketServer(BaseSocketServer):
             await traffic_stats_inc(f"error_connection_{self._target}")
         finally:
             await traffic_stats_inc(f"closed_connection_{self._target}")
-            client_writer.close()
 
         try:
             await asyncio.sleep(self._iter_timeout)
+            client_writer.close()
         except Exception as err:
             logger.warning(f"Closing {client} error: {err}")
 
@@ -413,7 +415,7 @@ class LocalConnectionServer:
     """
 
     sockets: Dict[str, BaseSocketServer] = {}
-    service_check_interval: float = 3.0
+    service_check_interval: float = 4.0
     _iter_timeout: float = 0.0050
     _wait: bool = True
     _mqtt_client = None
@@ -579,18 +581,17 @@ class LocalConnectionServer:
                     break
 
             chunk.m.sort(key=sort_message)
+            await traffic_stats_inc(f"mqtt_in_{target}", len(message.payload))
             for msg in chunk.m:
                 if msg.x:
-                    logger.warning(f"Client {msg.client} closing connection")
+                    logger.warning(f"Client {msg.client} closing connection in server")
 
-                await traffic_stats_inc(f"mqtt_in_{target}", len(message.payload))
                 if not sock_server.has_client(msg.client):
                     continue
 
                 if msg.x:
                     try:
                         sock_server.put_client_message(msg.client, STOP_W)
-                        # self._closig[msg.client] = datetime.now()
                     except asyncio.QueueFull:
                         logger.warning(f"Failed to send STOP_W to client {msg.client}.")
                     except Exception as err:
