@@ -35,6 +35,7 @@ from .common import qos
 from .common import read_env_float
 from .common import read_env_int
 from .common import read_env_list
+from .common import run_async
 from .common import save_stat
 from .common import set_stats_value
 from .common import sort_message
@@ -54,7 +55,7 @@ logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message
 
 class PublishManager:
     """
-    Publishes chunks of messages via MQTT to many topics.
+    Manages publishing of message chunks via MQTT to multiple topics.
     """
     executor: Optional[ProcessPoolExecutor]
     topic_queue: dict[str, asyncio.Queue] = {}
@@ -65,11 +66,11 @@ class PublishManager:
     _warning_size: int = 96
 
     def send(self, topic: str, msg: Message):
-        """Send a message to the internal queue for publishing."""
+        """Add a message to the queue for publishing."""
         self.topic_queue[topic].put_nowait(msg)
 
     def __init__(self, mqtt_client: Client, executor: Optional[ProcessPoolExecutor]):
-        """Initialize service."""
+        """Initialize the PublishManager."""
         self.index = IndexManager()
         self.executor = executor
         self.mqtt_client = mqtt_client
@@ -78,6 +79,7 @@ class PublishManager:
             logger.info(f"Using MP with {WORKERS} workers")
 
     def close(self):
+        """Stop the publishing process."""
         self._wait = False
 
     async def process(self, topic: str):
@@ -133,16 +135,18 @@ class PublishManager:
 
 
 class UdpProxyProtocol(asyncio.DatagramProtocol):
-    """Protocol for handling UDP proxy connections"""
+    """Handles UDP proxy connections and forwards data."""
 
     transport: Optional[DatagramTransport] = None
     server: Optional["OutConnectionServer"] = None
     _queue: Optional[asyncio.Queue] = None
 
     def connection_made(self, transport: DatagramTransport):
+        """Initialize the transport."""
         self.transport = transport
 
     def __init__(self, target: str, connection_id: str, server: Any, client_queue: asyncio.Queue):
+        """Initialize the UDP proxy protocol."""
         self.target = target
         self.server = server
         self.index = 0
@@ -150,7 +154,7 @@ class UdpProxyProtocol(asyncio.DatagramProtocol):
         self._queue = client_queue
 
     def datagram_received(self, data: bytes, addr_info: tuple[str, int]):
-        """Handle incoming UDP datagrams"""
+        """Process incoming UDP datagrams."""
         addr, _ = addr_info
         server = self.server
         logger.debug(f"Data {len(data)} from {addr}")
@@ -161,9 +165,11 @@ class UdpProxyProtocol(asyncio.DatagramProtocol):
         server.pub.send(topic, msg)
 
     def error_received(self, exc):
+        """Handle connection errors."""
         logger.warning(f"Error for closing {exc} for {self.connection_id}")
 
     def connection_lost(self, exc):
+        """Handle connection loss."""
         logger.info(f"Connection {self.connection_id} lost")
         if self._queue:
             try:
@@ -175,9 +181,8 @@ class UdpProxyProtocol(asyncio.DatagramProtocol):
 class OutConnectionServer:
     """
     TCP proxy server that forwards data between TCP targets and MQTT topics.
-    This server manages connections to multiple TCP targets and routes data
-    through MQTT topics. It handles connection establishment, data forwarding,
-    and cleanup of idle connections.
+    Manages connections to multiple TCP targets and routes data through MQTT topics.
+    Handles connection establishment, data forwarding, and cleanup of idle connections.
     """
 
     short_buffer_size: int = 512
@@ -239,6 +244,7 @@ class OutConnectionServer:
                 self.pub.send(topic, Message(index, connection_id, b"", b"", 1))
                 continue
             else:
+                self._latest_message[(target, connection_id)] = datetime.now()
                 self.pub.send(topic, msg)
 
     async def _process_writer(self, writer: asyncio.StreamWriter, queue: asyncio.Queue):
@@ -251,7 +257,7 @@ class OutConnectionServer:
         iter_time = self._wait_iteration_time
         while not quit_cmd:
             try:
-                msg = await asyncio.wait_for(queue.get(), timeout=iter_time)
+                msg: Message = await asyncio.wait_for(queue.get(), timeout=iter_time)
             except asyncio.TimeoutError:
                 msg = None
 
@@ -260,7 +266,6 @@ class OutConnectionServer:
                     quit_cmd = True
                     continue
 
-                self._latest_message[msg.client] = datetime.now()
                 try:
                     writer.write(msg.data)
                     await writer.drain()
@@ -351,9 +356,8 @@ class OutConnectionServer:
     async def create_target_udp_connection(self, target: str, connection_id: str, queue: asyncio.Queue):
         """
         Create and manage a UDP connection to a target endpoint.
-        This method establishes a UDP datagram endpoint to the specified target and 
-        handles message forwarding between the queue and the UDP socket. It continuously
-        monitors the queue for incoming messages and sends them through the UDP connection.
+        Establishes a UDP datagram endpoint to the specified target and
+        handles message forwarding between the queue and the UDP socket.
         """
         t_name, target_host, target_port = self.udp_targets[target]
         loop = asyncio.get_event_loop()
@@ -374,7 +378,7 @@ class OutConnectionServer:
                     quit_cmd = True
                     continue
 
-                self._latest_message[msg.client] = datetime.now()
+                self._latest_message[(target, msg.client)] = datetime.now()
                 if msg.x:
                     quit_cmd = True
                     logger.info(f"Closing udp {target} {connection_id} by request")
@@ -482,6 +486,7 @@ class OutConnectionServer:
                         break
 
             if message.payload:
+                now = datetime.now()
                 try:
                     chunk: Chunk = pickle.loads(message.payload)
                 except Exception as err:
@@ -493,7 +498,7 @@ class OutConnectionServer:
                 chunk.m.sort(key=sort_message)
                 for msg in chunk.m:
                     route_key = (target, msg.client)
-                    self._latest_message[route_key] = datetime.now()
+                    self._latest_message[route_key] = now
 
                     queue = None
                     if msg.x:
@@ -557,9 +562,8 @@ class OutConnectionServer:
                 # Check if connection is idle
                 connection_key = (conn_code, connection_id)
                 if connection_key in self._latest_message:
-                    last_message_time: datetime = self._latest_message.get(connection_key, current_time)
-                    if (current_time - last_message_time).total_seconds() > idle_limit:
-                        # Connection is idle, mark for cleanup
+                    last_activity = self._latest_message[connection_key]
+                    if (current_time - last_activity).total_seconds() > idle_limit:
                         connections_to_remove.append(connection_key)
 
             if connections_to_remove:
@@ -576,7 +580,7 @@ class OutConnectionServer:
                         try:
                             await task
                         except asyncio.CancelledError:
-                            pass
+                            ...
                         except Exception as err:
                             logger.error(f"Error canceling task for connection {connection_key}: {err}")
 
@@ -656,7 +660,7 @@ class OutConnectionServer:
             tasks.append(loop.create_task(self.pub.process(topic)))
 
         tasks.append(loop.create_task(self.wait_messages()))
-        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)            
+        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         # Cancel remaining tasks
         for task in pending:
             self.pub.close()
@@ -664,7 +668,7 @@ class OutConnectionServer:
             try:
                 await task
             except asyncio.CancelledError:
-                pass
+                ...
 
 
 async def main():
@@ -678,4 +682,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_async(main())

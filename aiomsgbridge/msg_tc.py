@@ -32,6 +32,7 @@ from .common import make_restore_data
 from .common import qos
 from .common import read_env_list
 from .common import read_env_str
+from .common import run_async
 from .common import save_stat
 from .common import set_stats_value
 from .common import sort_message
@@ -49,7 +50,7 @@ level = getattr(logging, LOG_LEVEL.upper(), logging.WARNING)
 
 
 class ChunkPublisher:
-    """Publishes chunks of messages via MQTT."""
+    """Publishes messages in chunks via MQTT."""
     _warning_size: int = 96
     _queue: asyncio.Queue
     mqtt_client: Client
@@ -58,11 +59,11 @@ class ChunkPublisher:
     _wait: bool = True
 
     def send(self, msg: Message):
-        """Send a message to the internal queue for publishing."""
+        """Add a message to the queue for publishing."""
         self._queue.put_nowait(msg)
 
     def __init__(self, mqtt_client: Client, topic: str):
-        """Initialize the ChunkPublisher."""
+        """Initialize ChunkPublisher with MQTT client and topic."""
         self.index = IndexManager()
         self._queue = asyncio.Queue()
         self.topic = topic
@@ -70,6 +71,7 @@ class ChunkPublisher:
         self._wait = True
 
     def close(self):
+        """Stop processing messages."""
         self._wait = False
 
     async def process(self):
@@ -121,7 +123,7 @@ class BaseSocketServer:
     _mqtt_client = None
     _topoc: str
     res_topic: str
-    _latest_message: Dict[tuple, datetime] = {}
+    _latest_message: Dict[str, datetime] = {}
     _executor: ProcessPoolExecutor = None
     # target
     _target: str = ""
@@ -200,7 +202,7 @@ class BaseSocketServer:
     def put_client_message(self, client: str, msg: Any) -> bool:
         """Put a message into the client's queue."""
         self._out_routes[client].put_nowait(msg)
-    
+
     def del_client_route(self, client: str):
         """Remove a client route from the server."""
         if client in self._out_routes:
@@ -209,7 +211,7 @@ class BaseSocketServer:
 
 class UdpSocketServer(BaseSocketServer):
     """
-    UDP socket server implementation for proxy functionality.    
+    UDP socket server implementation for proxy functionality.
     Handles UDP connections and forwards data between clients and target services
     through MQTT broker.
     """
@@ -409,9 +411,8 @@ class UdpProxyProtocol(asyncio.DatagramProtocol):
 
 class LocalConnectionServer:
     """
-    TCP/UDP connection server that manages proxy connections to target hosts.
-    This server handles TCP/UDP connections, forwards traffic through MQTT,
-    and maintains connection statistics.
+    TCP/UDP connection server managing proxy connections to target hosts.
+    Handles TCP/UDP connections, forwards traffic via MQTT, and maintains connection stats.
     """
 
     sockets: Dict[str, BaseSocketServer] = {}
@@ -423,9 +424,8 @@ class LocalConnectionServer:
     async def make_udp_server(self, new_server: UdpSocketServer):
         """
         Starts a UDP server to listen for incoming connections.
-        This method creates a UDP transport socket on the specified host and port,
-        which forwards incoming traffic through an MQTT broker.
-        The server runs in a loop until it is manually stopped.
+        Creates a UDP transport socket on specified host/port, forwards traffic via MQTT.
+        Runs until manually stopped.
         """
         loop = asyncio.get_event_loop()
         transport = None
@@ -456,7 +456,7 @@ class LocalConnectionServer:
             logger.error(f"Error starting server: {err}")
 
     async def make_tcp_server(self, new_server: TcpSocketServer):
-        """Start a TCP server for the given SocketServer instance."""
+        """Starts a TCP server for the given SocketServer instance."""
         server = await asyncio.start_server(new_server.handle_client, new_server._host, new_server._port)
         logger.info(f"Server started on TCP {new_server._host}:{new_server._port} connection to {BROKER_HOST}")
         async with server:
@@ -464,7 +464,7 @@ class LocalConnectionServer:
             await server.serve_forever()
 
     async def connect(self):
-        """Create connection to broker."""
+        """Establishes connection to MQTT broker."""
         wait = True
         async with Client(
             hostname=BROKER_HOST,
@@ -479,7 +479,7 @@ class LocalConnectionServer:
                 wait = self._wait
 
     async def start_server(self, executor: Optional[ProcessPoolExecutor] = None):
-        """Start the proxy server with configured target sockets."""
+        """Starts proxy server with configured target sockets."""
         self._executor = executor
         self.sockets = {}
         handlers = []
@@ -537,7 +537,7 @@ class LocalConnectionServer:
             await asyncio.gather(*handlers)
 
     async def service_process(self):
-        """Periodically clean up connections and save traffic statistics."""
+        """Periodically cleans up connections and saves traffic statistics."""
         while self._wait:
             await asyncio.sleep(self.service_check_interval)
             for _, server in self.sockets.items():
@@ -546,7 +546,7 @@ class LocalConnectionServer:
             await save_stat(logger)
 
     async def wait_messages(self):
-        """Wait for and process incoming MQTT messages."""
+        """Waits for and processes incoming MQTT messages."""
         loop = asyncio.get_event_loop()
 
         up_topics = 0
@@ -642,4 +642,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_async(main())

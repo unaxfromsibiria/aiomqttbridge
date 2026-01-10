@@ -15,7 +15,7 @@ from cryptography.fernet import Fernet
 
 @dataclass
 class Message:
-    """Represents a message with sequence number, client identifier, data, version, and x value."""
+    """Message with sequence number, client identifier, data, version, and x value."""
     num: int
     client: str
     data: bytes
@@ -25,28 +25,29 @@ class Message:
 
 @dataclass
 class Chunk:
-    """Chunk with messages"""
+    """Chunk with messages."""
     m: list[Message]
     i: int
 
 
 def sort_message(msg: Message) -> int:
+    """Return the sequence number of the message for sorting."""
     return msg.num
 
 
 def read_env_str(name: str, default: str = "") -> str:
-    """Read an environment variable and return its string value."""
+    """Read environment variable and return its string value."""
     return str(os.environ.get(name, default))
 
 
 def read_env_bool(name: str, default: bool = False) -> bool:
-    """Read an environment variable and convert its value to boolean."""
+    """Read environment variable and convert its value to boolean."""
     value = os.environ.get(name, f"{default}").lower()
     return value in ("true", "on", "ok", "1", "yes")
 
 
 def read_env_float(name: str, default: float = 0.0) -> float:
-    """Read an environment variable and convert its value to float."""
+    """Read environment variable and convert its value to float."""
     try:
         return float(os.environ.get(name, default))
     except ValueError:
@@ -54,22 +55,21 @@ def read_env_float(name: str, default: float = 0.0) -> float:
 
 
 def read_env_int(name: str, default: int = 0) -> int:
-    """Read an environment variable and convert its value to integer."""
+    """Read environment variable and convert its value to integer."""
     try:
         return int(os.environ.get(name, default))
     except ValueError:
         return default
 
 
-def read_env_list(name: str, split_with: str = ";", default: list = []) -> list[str]:
-    """Read an environment variable and return its value as a list."""
+def read_env_list(name: str, default: list = [], split_with: str = ";") -> list[str]:
+    """Read environment variable and return its value as a list."""
     result = []
     values = read_env_str(name)
     if values:
         result.extend(values.split(split_with))
     else:
         result.extend(default)
-
     return result
 
 
@@ -87,7 +87,7 @@ async def traffic_stats_inc(key: str, val: int = 1):
 
 
 async def set_stats_value(key: str, val: float):
-    """Increment traffic statistics for a given key."""
+    """Set traffic statistics value for a given key."""
     async with stat_lock:
         traffic_stats[key] = val
 
@@ -110,13 +110,12 @@ STAT_FILE = read_env_str("STAT_FILE")
 MEMORY_STAT = read_env_bool("MEMORY_STAT", False)
 CHUNK_COLLECT_DELAY = read_env_float("CHUNK_COLLECT_DELAY", 0.06)
 
-
 if STAT_FILE and MEMORY_STAT:
     tracemalloc.start()
 
 
 def get_current_stat() -> dict:
-    """Create dict with the service current statistic values."""
+    """Return current service statistics."""
     traffic_stats_dict = dict(traffic_stats)
     traffic_stats_dict["updated"] = datetime.now().isoformat()
     coroutines_count = sum(1 for _ in asyncio.all_tasks())
@@ -130,11 +129,9 @@ def get_current_stat() -> dict:
 
 
 async def save_stat(logger: logging.Logger):
-    """Record statistic"""
+    """Save current statistics to file."""
     if not STAT_FILE:
         return
-
-    # save satistic
     try:
         async with aiofiles.open(STAT_FILE, "w") as json_file:
             await json_file.write(json.dumps(get_current_stat(), indent=2))
@@ -142,12 +139,14 @@ async def save_stat(logger: logging.Logger):
         logger.error(f"Problem {err} in saving statistic into '{STAT_FILE}'")
 
 
+run_async = asyncio.run
 if uvloop:
     try:
         import uvloop
-        uvloop.install()
     except Exception as err:
         log_warn(err)
+    else:
+        run_async = uvloop.run
 
 
 def make_convert_data(data: bytes) -> bytes:
@@ -166,6 +165,7 @@ def make_restore_data(data: bytes) -> bytes:
 
 
 class IndexManager:
+    """Manage sequence numbers with overflow protection."""
     _value = 0
     _limit = 2 ** 32 - 1
 
@@ -173,8 +173,8 @@ class IndexManager:
         self._value = 0
 
     def get(self) -> int:
+        """Get next sequence number."""
         self._value += 1
         if self._value >= self._limit:
-            self._value = 0
-
+            self._value = 1
         return self._value
